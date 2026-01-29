@@ -36,6 +36,7 @@ Since this extension is not published in the Web Store, you need to install it m
 3.  Click it and choose where to save your file.
 4.  Wait for the download to finish. The button will show the progress percentage.
 
+I'll be honest, the page that allows me to upload the extension to the Microsoft Edge store doesn't work, and to upload the extension to the Chrome Web Store, Google asks me to pay $5... Something I have no intention of doing...
 ---
 
 ## 🇪🇸 Español
@@ -70,6 +71,7 @@ Como esta extensión no está publicada en la tienda, necesitas instalarla manua
 3.  Haz clic y elige dónde guardar tu archivo.
 4.  Espera a que termine la descarga. El botón mostrará el porcentaje de progreso.
 
+Seré honesto, la página que me permite subir la extensión a la tienda de Microsoft Edge no funciona y para subir la extensión a la Chrome Web Store Google me pide que pague 5 dólares... Algo que no pienso hacer...
 ---
 
 ## ⚠️ Disclaimer / Aviso
