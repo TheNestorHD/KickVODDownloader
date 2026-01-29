@@ -11,7 +11,7 @@
 *   **One-Click Download**: Adds a native-looking "Download MP4" button directly to the Kick video player interface.
 *   **Direct MP4 Conversion**: Automatically converts Kick's HLS streams (.m3u8) into standard MP4 files on the fly, right within your browser.
 *   **Memory Efficient**: Uses the File System Access API to write directly to your disk, ensuring even long streams download smoothly without crashing your browser.
-*   **Persistent Progress**: If you resize the window or the DOM updates, the download state is saved so you never lose track.
+*   **Persistent Progress**: If you resize the window or the window content updates, the download state is saved so you never lose track.
 *   **Global Progress Tracking**: Monitor download progress via the extension icon badge and the browser tab title (e.g., `[45%] Video Title`), visible even when switching tabs.
 *   **Auto-Mute**: Automatically mutes the tab during download to prevent audio interference, restoring original settings afterwards.
 *   **Smart Cleanup**: Automatically cleans up temporary files if a download is interrupted or the page is closed.
@@ -48,7 +48,7 @@ To be honest, I uploaded the extension to GitHub because the Microsoft Edge add-
 *   **Descarga en un Clic**: Añade un botón "Download MP4" directamente en la interfaz del reproductor de Kick.
 *   **Conversión Directa a MP4**: Convierte automáticamente los streams HLS (.m3u8) de Kick en archivos MP4 estándar al vuelo, dentro de tu navegador.
 *   **Eficiencia de Memoria**: Utiliza la API de Acceso al Sistema de Archivos para escribir directamente en tu disco, permitiendo descargar streams largos sin colapsar el navegador.
-*   **Progreso Persistente**: Si redimensionas la ventana o la página se actualiza, el estado de la descarga se mantiene.
+*   **Progreso Persistente**: Si redimensionas la ventana o el contenido de la página se actualiza, el estado de la descarga se mantiene.
 *   **Progreso en Icono**: Monitorea el progreso de la descarga directamente desde el icono de la extensión, incluso si cambias de pestaña.
 *   **Auto-Silenciado**: Silencia automáticamente la pestaña durante la descarga para evitar interferencias de audio, restaurando la configuración original al finalizar.
 *   **Cancelación Automática**: Si cambias de video o sales de la página, la descarga se detiene y borra los archivos parciales.
