@@ -1,0 +1,44 @@
+.kick-vod-download-btn {
+    background-color: #53fc18;
+    color: #000;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-weight: bold;
+    cursor: pointer;
+    margin-left: 10px;
+    font-family: 'Inter', sans-serif;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: background-color 0.2s;
+    font-size: 14px;
+    z-index: 9999;
+}
+
+.kick-vod-download-btn:hover {
+    background-color: #42ca14;
+}
+
+.kick-vod-download-btn:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.kick-vod-download-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* Estilos para el modo flotante (fallback) */
+.kick-vod-download-btn.floating-mode {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    margin: 0;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+    border: 2px solid #fff;
+    padding: 12px 20px;
+    font-size: 16px;
+}
