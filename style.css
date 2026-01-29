@@ -42,3 +42,76 @@
     padding: 12px 20px;
     font-size: 16px;
 }
+
+/* Full screen overlay blocking interaction */
+#kick-vod-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.85);
+    z-index: 2147483647; /* Max z-index */
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    color: #fff;
+    font-family: 'Inter', sans-serif;
+    text-align: center;
+    pointer-events: all; /* Capture all clicks */
+    backdrop-filter: blur(5px);
+}
+
+#kick-vod-overlay h2 {
+    font-size: 2rem;
+    margin-bottom: 20px;
+    color: #53fc18;
+}
+
+#kick-vod-overlay p {
+    font-size: 1.2rem;
+    margin-bottom: 30px;
+    max-width: 600px;
+    line-height: 1.5;
+}
+
+#kick-vod-overlay .progress-bar-container {
+    width: 80%;
+    max-width: 600px;
+    height: 20px;
+    background-color: #333;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 10px;
+    border: 1px solid #555;
+}
+
+#kick-vod-overlay .progress-bar-fill {
+    height: 100%;
+    background-color: #53fc18;
+    width: 0%;
+    transition: width 0.3s ease;
+}
+
+#kick-vod-overlay .progress-text {
+    font-size: 1.5rem;
+    font-weight: bold;
+    margin-bottom: 30px;
+}
+
+#kick-vod-overlay .cancel-btn {
+    background-color: #ff4444;
+    color: white;
+    border: none;
+    padding: 10px 25px;
+    border-radius: 5px;
+    font-size: 1rem;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background 0.2s;
+}
+
+#kick-vod-overlay .cancel-btn:hover {
+    background-color: #cc0000;
+}

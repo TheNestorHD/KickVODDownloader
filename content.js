@@ -1,9 +1,41 @@
 // Global variables for cleanup
 let currentFileHandle = null;
 let currentWritable = null;
+let currentDownloadVideoId = null; // Track which video we are downloading
+let currentDownloadPath = null;
+let isDownloading = false;
+let cancelRequested = false;
+let originalPageTitle = '';
+const originalMediaStates = new Map();
 
-// IndexedDB Helper for robust cleanup
-const DB_NAME = 'KickDownloaderDB';
+function mutePageAudio() {
+    const media = document.querySelectorAll('video, audio');
+    media.forEach(el => {
+        if (!originalMediaStates.has(el)) {
+            originalMediaStates.set(el, { muted: el.muted, volume: el.volume, paused: el.paused });
+        }
+        try {
+            el.muted = true;
+            el.volume = 0;
+            if (typeof el.pause === 'function') el.pause();
+        } catch (_) {}
+    });
+}
+
+function restorePageAudio() {
+    originalMediaStates.forEach((state, el) => {
+        try {
+            el.muted = state.muted;
+            el.volume = state.volume;
+            if (!state.paused && typeof el.play === 'function') {
+                el.play().catch(() => {});
+            }
+        } catch (_) {}
+    });
+    originalMediaStates.clear();
+}
+
+// IndexedDB Helper for robust cleanupconst DB_NAME = 'KickDownloaderDB';
 const STORE_NAME = 'handles';
 
 function openDB() {
@@ -80,6 +112,10 @@ const handleUnload = () => {
 window.addEventListener('beforeunload', handleUnload);
 window.addEventListener('pagehide', handleUnload);
 
+// Listen for messages from background script (Navigation detection)
+// Removed navigation detection logic.
+// We now allow navigation while downloading.
+
 // Function to extract video ID from URL
 function getVideoId() {
     // 1. Try to find UUID explicitly (most robust)
@@ -118,8 +154,85 @@ function updateButton(btn, text, disabled = false, progress = null) {
     }
 }
 
+// Helper to create and update overlay
+function updateOverlay(progress, text = 'Downloading...') {
+    let overlay = document.getElementById('kick-vod-overlay');
+    
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'kick-vod-overlay';
+        overlay.innerHTML = `
+            <h2>Downloading VOD / Descargando VOD</h2>
+            <p>Please do not close this tab or navigate away.<br>Por favor, no cierres esta pestaña ni navegues a otra página.</p>
+            <div class="progress-bar-container">
+                <div class="progress-bar-fill"></div>
+            </div>
+            <div class="progress-text">0%</div>
+            <button class="cancel-btn">Cancel Download / Cancelar</button>
+        `;
+        document.body.appendChild(overlay);
+        
+        // Prevent scroll
+        document.body.style.overflow = 'hidden';
+        mutePageAudio();
+
+        // Bind cancel button
+        overlay.querySelector('.cancel-btn').addEventListener('click', async () => {
+             if (confirm('Are you sure you want to cancel? / ¿Seguro que quieres cancelar?')) {
+                 cancelRequested = true;
+                 overlay.querySelector('h2').textContent = 'Cancelling...';
+             }
+        });
+    }
+
+    if (progress !== null) {
+        overlay.querySelector('.progress-bar-fill').style.width = `${progress}%`;
+        overlay.querySelector('.progress-text').textContent = `${progress}%`;
+        // Send progress to background script for badge update
+        try {
+            chrome.runtime.sendMessage({ type: 'UPDATE_PROGRESS', progress: progress }).catch(() => {});
+        } catch (e) { /* ignore */ }
+        
+        // Update page title
+        if (originalPageTitle && progress !== 100) {
+             document.title = `[${progress}%] ${originalPageTitle}`;
+        }
+    }
+}
+
+function removeOverlay() {
+    const overlay = document.getElementById('kick-vod-overlay');
+    if (overlay) {
+        // Clear badge
+        try {
+            chrome.runtime.sendMessage({ type: 'UPDATE_PROGRESS', progress: null }).catch(() => {});
+        } catch (e) { /* ignore */ }
+
+        // Restore title
+        if (originalPageTitle) {
+            document.title = originalPageTitle;
+            originalPageTitle = '';
+        }
+
+        restorePageAudio();
+        overlay.remove();
+        document.body.style.overflow = ''; // Restore scroll
+    }
+}
+
 async function downloadSegments(streamUrl, btn) {
     try {
+        isDownloading = true;
+        cancelRequested = false;
+        
+        // Save original title only if not already saved (prevents recursion issues)
+        if (!originalPageTitle) {
+            originalPageTitle = document.title;
+        }
+
+        // Show blocking overlay
+        updateOverlay(0);
+
         // 1. Fetch playlist
         const response = await fetch(streamUrl);
         const playlistText = await response.text();
@@ -163,6 +276,7 @@ async function downloadSegments(streamUrl, btn) {
         });
         
         currentFileHandle = handle; // Track for cleanup
+        currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
         saveHandleToDB(handle); // Save to DB for recovery
         
         const writable = await handle.createWritable();
@@ -185,6 +299,10 @@ async function downloadSegments(streamUrl, btn) {
         updateButton(btn, 'Downloading...', true, 0);
         
         for (let i = 0; i < segments.length; i++) {
+            if (cancelRequested) {
+                throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
+            }
+
             try {
                 const segRes = await fetch(segments[i]);
                 if (!segRes.ok) throw new Error(`Failed to fetch segment ${i}`);
@@ -197,6 +315,7 @@ async function downloadSegments(streamUrl, btn) {
                 // Update progress
                 const progress = Math.round(((i + 1) / segments.length) * 100);
                 updateButton(btn, 'Downloading...', true, progress);
+                updateOverlay(progress);
 
             } catch (err) {
                 console.error(`Error processing segment ${i}:`, err);
@@ -206,6 +325,12 @@ async function downloadSegments(streamUrl, btn) {
 
         await writable.close();
         updateButton(btn, 'Download Complete!', false);
+        isDownloading = false;
+        cancelRequested = false;
+        currentDownloadVideoId = null;
+        currentDownloadPath = null;
+        clearHandleFromDB();
+        removeOverlay(); // Remove overlay on success
         setTimeout(() => {
              btn.innerHTML = `
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
@@ -222,12 +347,34 @@ async function downloadSegments(streamUrl, btn) {
         if (currentFileHandle && currentFileHandle.remove) {
             await currentFileHandle.remove().catch(() => {});
         }
-        currentWritable = null;
         currentFileHandle = null;
+        currentWritable = null;
+        currentDownloadVideoId = null;
+        currentDownloadPath = null;
+        clearHandleFromDB();
 
         console.error('Download failed:', error);
-        alert('Download failed: ' + error.message);
-        updateButton(btn, 'Error', false);
+        
+        // Only alert if it's not a user cancellation
+        if (error.name === 'AbortError' || error.message.includes('user aborted') || error.message.includes('cancelled by user')) {
+             updateButton(btn, 'Cancelled', false);
+             setTimeout(() => {
+                  btn.innerHTML = `
+                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                         <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M12 9.75l-3 3m0 0l3 3m-3-3h7.5M8.25 12H12" />
+                     </svg>
+                     Download MP4
+                 `;
+                 btn.style.background = '';
+             }, 2000);
+        } else {
+            alert('Download failed: ' + error.message);
+            updateButton(btn, 'Error', false);
+        }
+        isDownloading = false;
+        cancelRequested = false;
+        
+        removeOverlay();
     }
 }
 
@@ -245,6 +392,12 @@ function createDownloadButton() {
     `;
 
     btn.addEventListener('click', async () => {
+        if (isDownloading) {
+            // Overlay should be blocking, but just in case
+            alert('Download in progress / Descarga en curso');
+            return;
+        }
+
         const videoId = getVideoId();
         if (!videoId) {
             alert('Could not find Video ID');
@@ -340,7 +493,16 @@ function injectButton() {
 // Persistencia: Comprobar cada segundo si el botón sigue ahí
 // Esto es necesario porque Kick es una SPA agresiva que regenera el DOM
 setInterval(() => {
-    if (getVideoId() && !document.querySelector('.kick-vod-download-btn')) {
+    const currentId = getVideoId();
+
+    // Navigation detection
+    if (currentDownloadVideoId && currentId && currentId !== currentDownloadVideoId) {
+        console.log('Navigation detected! Cancelling download...');
+        cancelRequested = true;
+        handleUnload();
+    }
+
+    if (currentId && !document.querySelector('.kick-vod-download-btn')) {
         injectButton();
     }
 }, 1000);
