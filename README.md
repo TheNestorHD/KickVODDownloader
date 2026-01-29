@@ -20,9 +20,7 @@
 
 Since this extension is not published in the Web Store, you need to install it manually:
 
-1.  **Download** this repository:
-    *   Click on the green **Code** button -> **Download ZIP**.
-    *   Unzip the file into a folder.
+1.  **Download** the last version on **releases** page and unzip the file into a folder.
 2.  Open your browser's extension manager:
     *   **Chrome**: Go to `chrome://extensions/`
     *   **Edge**: Go to `edge://extensions/`
@@ -57,9 +55,7 @@ Since this extension is not published in the Web Store, you need to install it m
 
 Como esta extensión no está publicada en la tienda, necesitas instalarla manualmente:
 
-1.  **Descarga** este repositorio:
-    *   Haz clic en el botón verde **Code** -> **Download ZIP**.
-    *   Descomprime el archivo en una carpeta.
+1.  **Descarga** la última versión en la página de **releases** y descomprime el archivo en una carpeta.
 2.  Abre el gestor de extensiones de tu navegador:
     *   **Chrome**: Ve a `chrome://extensions/`
     *   **Edge**: Ve a `edge://extensions/`
