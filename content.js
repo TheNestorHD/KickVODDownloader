@@ -35,7 +35,8 @@ function restorePageAudio() {
     originalMediaStates.clear();
 }
 
-// IndexedDB Helper for robust cleanupconst DB_NAME = 'KickDownloaderDB';
+// IndexedDB Helper for robust cleanup
+const DB_NAME = 'KickDownloaderDB';
 const STORE_NAME = 'handles';
 
 function openDB() {
@@ -155,7 +156,7 @@ function updateButton(btn, text, disabled = false, progress = null) {
 }
 
 // Helper to create and update overlay
-function updateOverlay(progress, text = 'Downloading...') {
+function updateOverlay(progress, text = 'Downloading...', etaText = '') {
     let overlay = document.getElementById('kick-vod-overlay');
     
     if (!overlay) {
@@ -168,6 +169,7 @@ function updateOverlay(progress, text = 'Downloading...') {
                 <div class="progress-bar-fill"></div>
             </div>
             <div class="progress-text">0%</div>
+            <div class="eta-text" style="margin-top: 10px; font-size: 0.9em; color: #ccc;"></div>
             <button class="cancel-btn">Cancel Download / Cancelar</button>
         `;
         document.body.appendChild(overlay);
@@ -188,6 +190,10 @@ function updateOverlay(progress, text = 'Downloading...') {
     if (progress !== null) {
         overlay.querySelector('.progress-bar-fill').style.width = `${progress}%`;
         overlay.querySelector('.progress-text').textContent = `${progress}%`;
+        
+        const etaEl = overlay.querySelector('.eta-text');
+        if (etaEl) etaEl.textContent = etaText;
+
         // Send progress to background script for badge update
         try {
             chrome.runtime.sendMessage({ type: 'UPDATE_PROGRESS', progress: progress }).catch(() => {});
@@ -197,6 +203,12 @@ function updateOverlay(progress, text = 'Downloading...') {
         if (originalPageTitle && progress !== 100) {
              document.title = `[${progress}%] ${originalPageTitle}`;
         }
+    }
+    
+    // Update main text if provided (e.g. "Finalizing...")
+    if (text && text !== 'Downloading...') {
+         const h2 = overlay.querySelector('h2');
+         if (h2) h2.textContent = text;
     }
 }
 
@@ -220,7 +232,162 @@ function removeOverlay() {
     }
 }
 
-async function downloadSegments(streamUrl, btn) {
+// Helper to patch MP4 headers (mvhd, tkhd, mdhd)
+function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
+    try {
+        const view = new DataView(initSegment.buffer, initSegment.byteOffset, initSegment.byteLength);
+        
+        // Helper to read box
+        const readBox = (pos) => {
+            if (pos + 8 > view.byteLength) return null;
+            const size = view.getUint32(pos);
+            const type = String.fromCharCode(
+                view.getUint8(pos + 4), view.getUint8(pos + 5),
+                view.getUint8(pos + 6), view.getUint8(pos + 7)
+            );
+            return { size, type, offset: pos };
+        };
+
+        // Recursive box searcher
+        const findBox = (start, end, type) => {
+            let pos = start;
+            while (pos < end) {
+                const box = readBox(pos);
+                if (!box) break;
+                if (box.type === type) return box;
+                pos += box.size;
+            }
+            return null;
+        };
+
+        // 1. Find moov
+        const moov = findBox(0, view.byteLength, 'moov');
+        if (!moov) return;
+
+        // 2. Patch mvhd (Movie Header)
+        const mvhd = findBox(moov.offset + 8, moov.offset + moov.size, 'mvhd');
+        let globalTimescale = 90000; // Default fallback
+        
+        if (mvhd) {
+            const version = view.getUint8(mvhd.offset + 8);
+            // 32-bit: v(1)+f(3)+cr(4)+mod(4)+scale(4)+dur(4) -> scale at 12, dur at 16
+            // 64-bit: v(1)+f(3)+cr(8)+mod(8)+scale(4)+dur(8) -> scale at 20, dur at 24
+            const timescaleOffset = mvhd.offset + 8 + (version === 0 ? 12 : 20);
+            const durationOffset = timescaleOffset + 4;
+            
+            globalTimescale = view.getUint32(timescaleOffset);
+            const durationUnits = Math.round((durationMs / 1000) * globalTimescale);
+            
+            console.log(`Patching mvhd: Timescale=${globalTimescale}, Duration=${durationUnits}`);
+            
+            if (version === 0) {
+                view.setUint32(durationOffset, durationUnits);
+            } else {
+                 // High 32 bits
+                 view.setUint32(durationOffset, Math.floor(durationUnits / 4294967296));
+                 // Low 32 bits
+                 view.setUint32(durationOffset + 4, durationUnits % 4294967296);
+            }
+        }
+
+        // 3. Patch trak -> tkhd (Track Header) and mdia -> mdhd (Media Header)
+        let trakPos = moov.offset + 8;
+        while (trakPos < moov.offset + moov.size) {
+            const box = readBox(trakPos);
+            if (!box) break;
+            if (box.type === 'trak') {
+                // Patch tkhd
+                const tkhd = findBox(box.offset + 8, box.offset + box.size, 'tkhd');
+                if (tkhd) {
+                    const version = view.getUint8(tkhd.offset + 8);
+                    // 32-bit: v(1)+f(3)+cr(4)+mod(4)+id(4)+res(4)+dur(4) -> dur at 20
+                    // 64-bit: v(1)+f(3)+cr(8)+mod(8)+id(4)+res(4)+dur(8) -> dur at 28
+                    // Note: offset relative to payload (after 8 byte header + 4 byte v/f)
+                    // Wait, logic check:
+                    // 32-bit: 4(v/f) + 4(cr) + 4(mod) + 4(id) + 4(res) = 20. Correct.
+                    // 64-bit: 4(v/f) + 8(cr) + 8(mod) + 4(id) + 4(res) = 28. Correct.
+                    const durationOffset = tkhd.offset + 8 + (version === 0 ? 20 : 28);
+                    
+                    // tkhd duration is in mvhd timescale (globalTimescale)
+                    const durationUnits = Math.round((durationMs / 1000) * globalTimescale);
+                    console.log(`Patching tkhd: Duration=${durationUnits}`);
+
+                    if (version === 0) {
+                        view.setUint32(durationOffset, durationUnits);
+                    } else {
+                        view.setUint32(durationOffset, Math.floor(durationUnits / 4294967296));
+                        view.setUint32(durationOffset + 4, durationUnits % 4294967296);
+                    }
+                }
+
+                // Patch mdia -> mdhd
+                const mdia = findBox(box.offset + 8, box.offset + box.size, 'mdia');
+                if (mdia) {
+                    const mdhd = findBox(mdia.offset + 8, mdia.offset + mdia.size, 'mdhd');
+                    if (mdhd) {
+                         const version = view.getUint8(mdhd.offset + 8);
+                         // mdhd structure is same as mvhd
+                         const timescaleOffset = mdhd.offset + 8 + (version === 0 ? 12 : 20);
+                         const durationOffset = timescaleOffset + 4;
+                         
+                         const localTimescale = view.getUint32(timescaleOffset);
+                         const durationUnits = Math.round((durationMs / 1000) * localTimescale);
+                         
+                         console.log(`Patching mdhd: Timescale=${localTimescale}, Duration=${durationUnits}`);
+
+                         if (version === 0) {
+                             view.setUint32(durationOffset, durationUnits);
+                         } else {
+                             view.setUint32(durationOffset, Math.floor(durationUnits / 4294967296));
+                             view.setUint32(durationOffset + 4, durationUnits % 4294967296);
+                         }
+                    }
+
+                    // Attempt to patch bitrate in minf -> stbl -> stsd -> avc1 -> btrt
+                    const minf = findBox(mdia.offset + 8, mdia.offset + mdia.size, 'minf');
+                    if (minf) {
+                        const stbl = findBox(minf.offset + 8, minf.offset + minf.size, 'stbl');
+                        if (stbl) {
+                            const stsd = findBox(stbl.offset + 8, stbl.offset + stbl.size, 'stsd');
+                            if (stsd) {
+                                // stsd has 8 bytes header + 4 bytes count. Entries start at offset+12
+                                const avc1 = findBox(stsd.offset + 12, stsd.offset + stsd.size, 'avc1');
+                                if (avc1) {
+                                    // avc1 header (8) + reserved(6) + dataRefIdx(2) + pre_defined(2) + reserved(2) + pre_defined(12) 
+                                    // + width(2) + height(2) + horiz_res(4) + vert_res(4) + reserved(4) + frame_count(2) 
+                                    // + compressorname(32) + depth(2) + pre_defined(2) = 78 bytes of VisualSampleEntry fields
+                                    // Children start after that.
+                                    const childrenStart = avc1.offset + 8 + 78;
+                                    const btrt = findBox(childrenStart, avc1.offset + avc1.size, 'btrt');
+                                    if (btrt) {
+                                        // btrt: size(4) + type(4) + bufferSizeDB(4) + maxBitrate(4) + avgBitrate(4)
+                                        const maxBitrateOffset = btrt.offset + 12;
+                                        const avgBitrateOffset = btrt.offset + 16;
+                                        
+                                        // Use calculated bitrate if available, otherwise fallback to reasonable defaults
+                                        const finalAvgBitrate = avgBitrate > 0 ? avgBitrate : 8000000;
+                                        // Max bitrate = Avg + 50% buffer, or at least 12Mbps
+                                        const finalMaxBitrate = Math.max(Math.round(finalAvgBitrate * 1.5), 12000000);
+                                        
+                                        view.setUint32(maxBitrateOffset, finalMaxBitrate);
+                                        view.setUint32(avgBitrateOffset, finalAvgBitrate);
+                                        console.log(`Patching btrt: Max=${finalMaxBitrate}, Avg=${finalAvgBitrate} (Source: ${avgBitrate > 0 ? 'Calculated' : 'Default'})`);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            trakPos += box.size;
+        }
+
+    } catch (e) {
+        console.error('Error patching MP4 headers:', e);
+    }
+}
+
+async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
     try {
         isDownloading = true;
         cancelRequested = false;
@@ -250,16 +417,37 @@ async function downloadSegments(streamUrl, btn) {
             const m3u8Match = lines.find(l => l.endsWith('.m3u8') && !l.startsWith('#'));
             if (m3u8Match) {
                 let newUrl = m3u8Match.startsWith('http') ? m3u8Match : baseUrl + m3u8Match;
-                return downloadSegments(newUrl, btn); // Recursion for variant playlist
+                return downloadSegments(newUrl, btn, videoDurationMs); // Recursion for variant playlist
             }
         }
 
-        // Parse segments
+        // Parse segments and calculate duration if needed
+        let calculatedDuration = 0;
+        let segmentDurations = [];
+        
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].trim();
+            
+            if (line.startsWith('#EXTINF:')) {
+                const durationStr = line.substring(8).split(',')[0];
+                const d = parseFloat(durationStr);
+                if (!isNaN(d)) {
+                    calculatedDuration += d;
+                    segmentDurations.push(d);
+                }
+            }
+
             if (line && !line.startsWith('#')) {
                 segments.push(line.startsWith('http') ? line : baseUrl + line);
             }
+        }
+
+        // Use calculated duration if API duration is missing or 0
+        if ((!videoDurationMs || videoDurationMs === 0) && calculatedDuration > 0) {
+            videoDurationMs = calculatedDuration * 1000;
+            console.log(`Calculated duration from M3U8: ${videoDurationMs} ms`);
+        } else if (videoDurationMs > 0) {
+            console.log(`Using API provided duration: ${videoDurationMs} ms`);
         }
 
         if (segments.length === 0) {
@@ -282,13 +470,32 @@ async function downloadSegments(streamUrl, btn) {
         const writable = await handle.createWritable();
         
         // 3. Initialize Transmuxer
-        const transmuxer = new muxjs.mp4.Transmuxer({keepOriginalTimestamps: true});
+        // We set keepOriginalTimestamps to false (default) to ensure the video starts at 0
+        // instead of the original stream timestamp (which could be hours into the recording).
+        const transmuxer = new muxjs.mp4.Transmuxer({keepOriginalTimestamps: false});
         let initSegmentWritten = false;
+        // Capture first segment duration for bitrate calculation
+        const firstSegmentDuration = segmentDurations.length > 0 ? segmentDurations[0] : 0;
 
         transmuxer.on('data', (segment) => {
             // Write init segment (ftyp + moov) only once
             if (!initSegmentWritten) {
-                 writable.write(new Uint8Array(segment.initSegment));
+                 let initSeg = new Uint8Array(segment.initSegment);
+                 
+                 // Calculate estimated bitrate from first segment
+                 let estimatedBitrate = 0;
+                 if (segment.data && segment.data.byteLength > 0 && firstSegmentDuration > 0) {
+                     // Bitrate = bits / seconds
+                     estimatedBitrate = Math.round((segment.data.byteLength * 8) / firstSegmentDuration);
+                     console.log(`Calculated Bitrate: ${estimatedBitrate} bps (Size: ${segment.data.byteLength} bytes, Dur: ${firstSegmentDuration}s)`);
+                 }
+
+                 if (videoDurationMs > 0) {
+                     patchMp4Header(initSeg, videoDurationMs, estimatedBitrate);
+                 } else {
+                     console.warn('Invalid video duration, skipping header patch');
+                 }
+                 writable.write(initSeg);
                  initSegmentWritten = true;
             }
             // Write media segment (moof + mdat)
@@ -298,6 +505,21 @@ async function downloadSegments(streamUrl, btn) {
         // 4. Download and process segments
         updateButton(btn, 'Downloading...', true, 0);
         
+        console.log(`Video Data Duration: ${videoDurationMs} ms`);
+
+        const startTime = Date.now();
+        let lastProgress = 0;
+
+        // Helper to format time (seconds) to MM:SS or HH:MM:SS
+        const formatTime = (seconds) => {
+            if (!isFinite(seconds) || seconds < 0) return '--:--';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        };
+
         for (let i = 0; i < segments.length; i++) {
             if (cancelRequested) {
                 throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
@@ -314,14 +536,34 @@ async function downloadSegments(streamUrl, btn) {
 
                 // Update progress
                 const progress = Math.round(((i + 1) / segments.length) * 100);
-                updateButton(btn, 'Downloading...', true, progress);
-                updateOverlay(progress);
+                
+                // Only update DOM if percentage changed to avoid thrashing
+                if (progress > lastProgress) {
+                    lastProgress = progress;
+                    
+                    // Calculate ETA
+                    const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+                    let etaText = 'Calculating time...';
+                    
+                    if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
+                        const rate = (i + 1) / elapsedTime; // segments per second
+                        const remainingSegments = segments.length - (i + 1);
+                        const etaSeconds = remainingSegments / rate;
+                        etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
+                    }
+
+                    updateButton(btn, 'Downloading...', true, progress);
+                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText);
+                }
 
             } catch (err) {
                 console.error(`Error processing segment ${i}:`, err);
                 // Continue? or abort? Let's try to continue
             }
         }
+
+        // 100% reached, but still writing/closing
+        updateOverlay(100, 'Finalizing file writing... / Finalizando escritura del archivo...', 'Please wait / Por favor espere');
 
         await writable.close();
         updateButton(btn, 'Download Complete!', false);
@@ -410,7 +652,7 @@ function createDownloadButton() {
         const data = await fetchVideoData(videoId);
         
         if (data && data.source) {
-            await downloadSegments(data.source, btn);
+            await downloadSegments(data.source, btn, data.duration);
         } else {
             alert('Could not find video source.');
             btn.disabled = false;
