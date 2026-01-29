@@ -74,5 +74,5 @@ Como esta extensión no está publicada en la tienda, necesitas instalarla manua
 
 ## ⚠️ Disclaimer / Aviso
 
-*   This extension is for **personal archiving purposes**. Please respect the copyright and intellectual property rights of streamers.
-*   *Esta extensión es para fines de **archivo personal**. Por favor, respeta los derechos de autor y la propiedad intelectual de los streamers.*
+*   This extension is for **personal archiving purposes and VODs recover**. Please respect the copyright and intellectual property rights of streamers.
+*   *Esta extensión es para fines de **archivo personal y recuperación de VODs**. Por favor, respeta los derechos de autor y la propiedad intelectual de los streamers.*
