@@ -38,7 +38,6 @@ Since this extension is not published in the Web Store, you need to install it m
 3.  Click it and choose where to save your file.
 4.  Wait for the download to finish. The button will show the progress percentage.
 
-To be honest, I uploaded the extension to GitHub because the Microsoft Edge add-ons store doesn't work, and to upload it to the Google Chrome store, they ask me for an initial payment of $5, which I don't intend to make.
 ---
 
 ## 🇪🇸 Español
@@ -76,7 +75,6 @@ Como esta extensión no está publicada en la tienda, necesitas instalarla manua
 3.  Haz clic y elige dónde guardar tu archivo.
 4.  Espera a que termine la descarga. El botón mostrará el porcentaje de progreso.
 
-Para ser honesto, subí la extensión a Github porque la tienda de add-ons de Microsoft Edge no funciona y para subirla a la tienda de Google Chrome me piden el pago incial de $5 el cual no pienso hacer.
 ---
 
 ## ⚠️ Disclaimer / Aviso
