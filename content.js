@@ -155,8 +155,18 @@ function updateButton(btn, text, disabled = false, progress = null) {
     }
 }
 
+// Helper to format bytes
+function formatBytes(bytes, decimals = 2) {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
 // Helper to create and update overlay
-function updateOverlay(progress, text = 'Downloading...', etaText = '') {
+function updateOverlay(progress, text = 'Downloading...', etaText = '', currentBytes = 0) {
     let overlay = document.getElementById('kick-vod-overlay');
     
     if (!overlay) {
@@ -169,6 +179,7 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '') {
                 <div class="progress-bar-fill"></div>
             </div>
             <div class="progress-text">0%</div>
+            <div class="size-text" style="font-size: 0.9em; color: #fff; margin-top: 5px; font-weight: bold;">Size / Tamaño: 0 MB</div>
             <div class="eta-text" style="margin-top: 10px; font-size: 0.9em; color: #ccc;"></div>
             <button class="cancel-btn">Cancel Download / Cancelar</button>
         `;
@@ -190,6 +201,11 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '') {
     if (progress !== null) {
         overlay.querySelector('.progress-bar-fill').style.width = `${progress}%`;
         overlay.querySelector('.progress-text').textContent = `${progress}%`;
+        
+        if (currentBytes > 0) {
+            const sizeEl = overlay.querySelector('.size-text');
+            if (sizeEl) sizeEl.textContent = `Size / Tamaño: ${formatBytes(currentBytes)}`;
+        }
         
         const etaEl = overlay.querySelector('.eta-text');
         if (etaEl) etaEl.textContent = etaText;
@@ -455,19 +471,52 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
         }
 
         // 2. Ask user for file save location
-        const handle = await window.showSaveFilePicker({
-            suggestedName: `kick-vod-${getVideoId()}.mp4`,
-            types: [{
-                description: 'MP4 Video',
-                accept: { 'video/mp4': ['.mp4'] },
-            }],
-        });
+        let handle = null;
+        let writable = null;
+        let memoryChunks = []; // Fallback for browsers without File System Access API (like Brave)
         
-        currentFileHandle = handle; // Track for cleanup
-        currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
-        saveHandleToDB(handle); // Save to DB for recovery
-        
-        const writable = await handle.createWritable();
+        try {
+            if (typeof window.showSaveFilePicker === 'function') {
+                handle = await window.showSaveFilePicker({
+                    suggestedName: `kick-vod-${getVideoId()}.mp4`,
+                    types: [{
+                        description: 'MP4 Video',
+                        accept: { 'video/mp4': ['.mp4'] },
+                    }],
+                });
+                
+                currentFileHandle = handle; // Track for cleanup
+                currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
+                saveHandleToDB(handle); // Save to DB for recovery
+                
+                writable = await handle.createWritable();
+            } else {
+                console.warn('File System Access API not supported. Using memory fallback.');
+                // Update overlay to warn user about memory usage
+                const overlayH2 = document.querySelector('#kick-vod-overlay h2');
+                if (overlayH2) overlayH2.textContent += ' (Memory Mode / Modo Memoria)';
+                
+                // Add permanent warning about RAM usage
+                const ramWarning = document.createElement('div');
+                ramWarning.style.color = '#ff4444';
+                ramWarning.style.fontWeight = 'bold';
+                ramWarning.style.marginTop = '10px';
+                ramWarning.style.padding = '10px';
+                ramWarning.style.border = '1px solid #ff4444';
+                ramWarning.style.backgroundColor = 'rgba(255, 68, 68, 0.1)';
+                ramWarning.innerHTML = '⚠️ WARNING: High RAM Usage Mode<br>Your browser does not support direct disk saving, so the video is stored in memory. Long VODs (>2h) may crash the browser.<br>The page will reload automatically after download to free up RAM.<br><br>⚠️ ADVERTENCIA: Modo de Alto Consumo de RAM<br>Tu navegador no soporta guardado directo en disco, por lo que el video se guarda en memoria. VODs largos (>2h) pueden colgar el navegador.<br>La página se recargará automáticamente al finalizar para liberar RAM.';
+                
+                const progressBarContainer = document.querySelector('.progress-bar-container');
+                if (progressBarContainer) {
+                    progressBarContainer.parentNode.insertBefore(ramWarning, progressBarContainer.nextSibling);
+                }
+            }
+        } catch (pickerError) {
+             // User cancelled picker or other error
+             isDownloading = false;
+             removeOverlay();
+             throw pickerError;
+        }
         
         // 3. Initialize Transmuxer
         // We set keepOriginalTimestamps to false (default) to ensure the video starts at 0
@@ -495,11 +544,21 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
                  } else {
                      console.warn('Invalid video duration, skipping header patch');
                  }
-                 writable.write(initSeg);
+                 
+                 if (writable) {
+                     writable.write(initSeg);
+                 } else {
+                     memoryChunks.push(initSeg);
+                 }
                  initSegmentWritten = true;
             }
             // Write media segment (moof + mdat)
-            writable.write(new Uint8Array(segment.data));
+            const mediaSeg = new Uint8Array(segment.data);
+            if (writable) {
+                writable.write(mediaSeg);
+            } else {
+                memoryChunks.push(mediaSeg);
+            }
         });
 
         // 4. Download and process segments
@@ -509,6 +568,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
 
         const startTime = Date.now();
         let lastProgress = 0;
+        let totalBytes = 0;
 
         // Helper to format time (seconds) to MM:SS or HH:MM:SS
         const formatTime = (seconds) => {
@@ -529,6 +589,9 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
                 const segRes = await fetch(segments[i]);
                 if (!segRes.ok) throw new Error(`Failed to fetch segment ${i}`);
                 const segData = await segRes.arrayBuffer();
+                
+                // Track total bytes
+                totalBytes += segData.byteLength;
                 
                 // Push to transmuxer
                 transmuxer.push(new Uint8Array(segData));
@@ -553,7 +616,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
                     }
 
                     updateButton(btn, 'Downloading...', true, progress);
-                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText);
+                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes);
                 }
 
             } catch (err) {
@@ -563,9 +626,37 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0) {
         }
 
         // 100% reached, but still writing/closing
-        updateOverlay(100, 'Finalizing file writing... / Finalizando escritura del archivo...', 'Please wait / Por favor espere');
+        updateOverlay(100, 'Finalizing file writing... / Finalizando escritura del archivo...', 'Please wait / Por favor espere', totalBytes);
 
-        await writable.close();
+        if (writable) {
+            await writable.close();
+        } else {
+            // Memory fallback: Create blob and trigger download
+            console.log('Finalizing memory download...');
+            const blob = new Blob(memoryChunks, { type: 'video/mp4' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `kick-vod-${getVideoId() || 'video'}.mp4`;
+            document.body.appendChild(a);
+            a.click();
+
+            // Alert user to reload manually if auto-reload fails or just as a reminder
+            alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalice, recarga la página o cierra la pestaña.");
+            
+            // Cleanup after a delay
+            setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                memoryChunks = []; // Free memory
+                
+                // Reload page to free RAM as requested
+                // Recargar página para liberar RAM como se solicitó
+                window.location.reload();
+            }, 10000);
+        }
+
         updateButton(btn, 'Download Complete!', false);
         isDownloading = false;
         cancelRequested = false;
