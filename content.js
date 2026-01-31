@@ -166,7 +166,8 @@ checkAndCleanup();
 
 // Cleanup on page reload/close
 const handleUnload = () => {
-    if (currentFileHandle) {
+    // Only delete file if we are in the middle of a download
+    if (isDownloading && currentFileHandle) {
         // Prioritize removing the file directly.
         // We do NOT call writable.abort() here because it might lock the file 
         // or delay the removal process in the short window we have.
@@ -259,7 +260,7 @@ function formatBytes(bytes, decimals = 2) {
 }
 
 // Helper to create and update overlay
-function updateOverlay(progress, text = 'Downloading...', etaText = '', currentBytes = 0) {
+function updateOverlay(progress, text = 'Downloading...', etaText = '', currentBytes = 0, currentSpeed = 0) {
     let overlay = document.getElementById('kick-vod-overlay');
     
     if (!overlay) {
@@ -359,7 +360,14 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '', currentB
         
         if (currentBytes > 0) {
             const sizeEl = overlay.querySelector('.size-text');
-            if (sizeEl) sizeEl.textContent = `Size / Tamaño: ${formatBytes(currentBytes)}`;
+            if (sizeEl) {
+                let sizeStr = `Size / Tamaño: ${formatBytes(currentBytes)}`;
+                if (currentSpeed > 0) {
+                    const speedMb = (currentSpeed / 1024 / 1024).toFixed(1);
+                    sizeStr += `  •  ${speedMb} MB/s`;
+                }
+                sizeEl.textContent = sizeStr;
+            }
         }
         
         const etaEl = overlay.querySelector('.eta-text');
@@ -568,7 +576,7 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
     }
 }
 
-async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSeconds = 0, endSeconds = -1) {
+async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null) {
     try {
         isDownloading = true;
         cancelRequested = false;
@@ -578,8 +586,46 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
             originalPageTitle = document.title;
         }
 
-        // Show blocking overlay
-        updateOverlay(0);
+        // --- FILE PICKER MOVED HERE TO SATISFY USER GESTURE REQUIREMENT ---
+        // We must ask for the file handle immediately, before any network requests (fetch)
+        let handle = preOpenedHandle;
+        
+        // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle
+        if (!handle && typeof window.showSaveFilePicker === 'function') {
+             try {
+                 // Suggest filename
+                 const suggestedName = `kick-vod-${getVideoId() || 'video'}.mp4`;
+                 
+                 handle = await window.showSaveFilePicker({
+                    suggestedName: suggestedName,
+                    types: [{
+                        description: 'MP4 Video',
+                        accept: { 'video/mp4': ['.mp4'] },
+                    }],
+                });
+                
+                // Store globally immediately
+                currentFileHandle = handle; 
+                saveHandleToDB(handle); 
+                
+                // Show overlay AFTER picker to avoid visual glitch if user cancels picker
+                updateOverlay(0);
+                
+             } catch (pickerError) {
+                 // User cancelled or error
+                 console.log('User cancelled save picker or error:', pickerError);
+                 isDownloading = false;
+                 setButtonToDownload(btn);
+                 return; // Stop execution
+             }
+        } else if (!handle) {
+            // No API support or fallback needed later
+            updateOverlay(0);
+        } else {
+            // We have a handle (recursive call), just show overlay
+             updateOverlay(0);
+        }
+        // ------------------------------------------------------------------
 
         // Try to get duration from DOM if API failed (common in fresh VODs)
         if (!videoDurationMs || videoDurationMs === 0) {
@@ -876,45 +922,39 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
             throw new Error('No segments found');
         }
 
-        // 2. Ask user for file save location
-        let handle = null;
+        // 2. Initialize Writable Stream or Fallback
+        // (File Picker was already handled at the start of function)
+        // Re-use the 'handle' variable from the function scope (argument)
         let writable = null;
         let memoryChunks = []; // Fallback for browsers without File System Access API (like Brave)
         
         try {
-            if (typeof window.showSaveFilePicker === 'function') {
-                handle = await window.showSaveFilePicker({
-                    suggestedName: `kick-vod-${getVideoId()}.mp4`,
-                    types: [{
-                        description: 'MP4 Video',
-                        accept: { 'video/mp4': ['.mp4'] },
-                    }],
-                });
-                
-                currentFileHandle = handle; // Track for cleanup
+            if (handle) {
+                // We have a handle from the user gesture at start
                 currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
-                saveHandleToDB(handle); // Save to DB for recovery
-                
                 writable = await handle.createWritable();
             } else {
-                console.warn('File System Access API not supported. Using IDB fallback.');
+                console.warn('File System Access API not supported or Handle missing. Using IDB fallback.');
                 // Update overlay to warn user about memory usage
                 const overlayH2 = document.querySelector('#kick-vod-overlay h2');
-                if (overlayH2) overlayH2.textContent += ' (Temp Disk Mode / Modo Disco Temporal)';
+                if (overlayH2 && !overlayH2.textContent.includes('Temp Disk')) {
+                     overlayH2.textContent += ' (Temp Disk Mode / Modo Disco Temporal)';
+                }
                 
                 // Add permanent warning about Fallback usage
-                const ramWarning = document.createElement('div');
-                ramWarning.style.color = '#ffaa00'; // Orange warning
-                ramWarning.style.fontWeight = 'bold';
-                ramWarning.style.marginTop = '10px';
-                ramWarning.style.padding = '10px';
-                ramWarning.style.border = '1px solid #ffaa00';
-                ramWarning.style.backgroundColor = 'rgba(255, 170, 0, 0.1)';
-                ramWarning.textContent = 'ℹ️ INFO: Compatibility Mode / Modo Compatibilidad\nYour browser does not support direct disk saving. The video will be stored in temporary storage and assembled at the end.\nPlease ensure you have enough free disk space (at least double the video size).\n\nℹ️ INFO: Modo Compatibilidad\nTu navegador no soporta guardado directo. El video se guardará en almacenamiento temporal y se ensamblará al final.\nAsegúrate de tener espacio libre (al menos el doble del tamaño del video).';
-                ramWarning.style.whiteSpace = 'pre-wrap';
-                
                 const progressBarContainer = document.querySelector('.progress-bar-container');
-                if (progressBarContainer) {
+                if (progressBarContainer && !document.querySelector('.kvd-fallback-warning')) {
+                    const ramWarning = document.createElement('div');
+                    ramWarning.className = 'kvd-fallback-warning'; // Add class to prevent duplicates
+                    ramWarning.style.color = '#ffaa00'; // Orange warning
+                    ramWarning.style.fontWeight = 'bold';
+                    ramWarning.style.marginTop = '10px';
+                    ramWarning.style.padding = '10px';
+                    ramWarning.style.border = '1px solid #ffaa00';
+                    ramWarning.style.backgroundColor = 'rgba(255, 170, 0, 0.1)';
+                    ramWarning.textContent = 'ℹ️ INFO: Compatibility Mode / Modo Compatibilidad\nYour browser does not support direct disk saving. The video will be stored in temporary storage and assembled at the end.\nPlease ensure you have enough free disk space (at least double the video size).\n\nℹ️ INFO: Modo Compatibilidad\nTu navegador no soporta guardado directo. El video se guardará en almacenamiento temporal y se ensamblará al final.\nAsegúrate de tener espacio libre (al menos el doble del tamaño del video).';
+                    ramWarning.style.whiteSpace = 'pre-wrap';
+                    
                     progressBarContainer.parentNode.insertBefore(ramWarning, progressBarContainer.nextSibling);
                 }
             }
@@ -988,6 +1028,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
         const startTime = Date.now();
         let lastProgress = 0;
         let totalBytes = 0;
+        
+        // Speed calculation variables
+        let currentSpeed = 0;
+        let lastSpeedTime = Date.now();
+        let lastSpeedBytes = 0;
+        let lastUiUpdate = 0;
 
         // Helper to format time (seconds) to MM:SS or HH:MM:SS
         const formatTime = (seconds) => {
@@ -1025,9 +1071,22 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
                 // Update progress
                 const progress = Math.round(((i + 1) / segments.length) * 100);
                 
-                // Only update DOM if percentage changed to avoid thrashing
-                if (progress > lastProgress) {
-                    lastProgress = progress;
+                // Calculate instantaneous speed and ETA every ~1s or when progress changes
+                const now = Date.now();
+                const timeDiff = (now - lastSpeedTime) / 1000; // seconds
+                
+                // Calculate speed every second regardless of progress change
+                if (timeDiff >= 1) { 
+                     const bytesDiff = totalBytes - lastSpeedBytes;
+                     currentSpeed = bytesDiff / timeDiff; // bytes per second
+                     lastSpeedTime = now;
+                     lastSpeedBytes = totalBytes;
+                }
+
+                // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
+                if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
+                    lastProgress = Math.max(lastProgress, progress); // Keep max progress
+                    lastUiUpdate = now;
                     
                     // Calculate ETA
                     const elapsedTime = (Date.now() - startTime) / 1000; // seconds
@@ -1041,7 +1100,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
                     }
 
                     updateButton(btn, 'Downloading...', true, progress);
-                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes);
+                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
                 }
 
             } catch (err) {
@@ -1119,6 +1178,8 @@ async function downloadSegments(streamUrl, btn, videoDurationMs = 0, startSecond
         cancelRequested = false;
         currentDownloadVideoId = null;
         currentDownloadPath = null;
+        currentFileHandle = null; // Prevent deletion on reload
+        currentWritable = null;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
         setTimeout(async () => {

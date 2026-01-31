@@ -1,5 +1,33 @@
 # Release Notes
 
+## v1.4.1 (Ready)
+2026-01-31
+
+### Features & Improvements 🚀
+- **Download Speed Indicator**: Added real-time download speed (MB/s) display in the download overlay.
+- **Auto-Reload**: Implemented automatic page reload (with 4s delay) after download completion to ensure memory cleanup and prevent state issues.
+- **Security Hardening**: Replaced all instances of `innerHTML` with safe DOM manipulation methods to comply with strict Firefox Add-on Store policies.
+
+### Bug Fixes 🐛
+- **File Persistence**: Fixed a critical issue where reloading the page or closing the tab would inadvertently delete the successfully downloaded file. Now, file deletion only occurs if a download is cancelled or interrupted.
+- **Manifest Compatibility**: Updated `strict_min_version` to 140.0 in Firefox manifest to resolve `data_collection_permissions` compatibility warnings.
+
+---
+
+## v1.4.1 (Listo) - Español 🇪🇸
+2026-01-31
+
+### Mejoras y Características 🚀
+- **Indicador de Velocidad**: Añadida visualización de la velocidad de descarga en tiempo real (MB/s) en el overlay.
+- **Auto-Recarga**: Implementada recarga automática de página (con 4s de retraso) tras finalizar la descarga para asegurar limpieza de memoria y evitar errores de estado.
+- **Seguridad**: Reemplazadas todas las instancias de `innerHTML` por métodos seguros de manipulación del DOM para cumplir con las políticas estrictas de la tienda de Firefox.
+
+### Correcciones 🐛
+- **Persistencia de Archivos**: Corregido un error crítico donde recargar la página o cerrar la pestaña eliminaba el archivo descargado aunque la descarga hubiera sido exitosa. Ahora el borrado solo ocurre si se interrumpe la descarga.
+- **Compatibilidad de Manifiesto**: Actualizada `strict_min_version` a 140.0 en el manifiesto de Firefox para resolver advertencias de compatibilidad con `data_collection_permissions`.
+
+---
+
 ## v1.4 (Ready)
 2026-01-31
 
@@ -64,9 +92,9 @@
 - **Better State Cleanup**: More robust reset of internal flags and database entries when a download is interrupted.
 
 ### Bug Fixes 🐛
-- Fixed an issue where the download button would think a download was still active after a user cancellation.
-- Fixed potential ghost files remaining if the user navigated away during the initial setup phase.
-- Fixed a visual bug where the tab title would show duplicate percentages (e.g., `[16%] [0%] Title`) due to recursive playlist handling.
+- **Fixed an issue where the download button would think a download was still active after a user cancellation.**
+- **Fixed potential ghost files remaining if the user navigated away during the initial setup phase.**
+- **Fixed a visual bug where the tab title would show duplicate percentages (e.g., `[16%] [0%] Title`) due to recursive playlist handling.**
 
 ---
 
@@ -98,8 +126,3 @@
 - **Manejo de Cancelación Mejorado**: Lógica mejorada para cancelar descargas. El error "Descarga en curso" ya no persiste si cancelas e intentas descargar de nuevo sin recargar la página.
 - **Mensajes de Error Amigables**: El mensaje de error que se muestra al cancelar el diálogo de "Guardar como" ahora es mucho más amigable y ya no muestra un error crudo del sistema.
 - **Mejor Limpieza de Estado**: Restablecimiento más robusto de banderas internas y entradas de base de datos cuando se interrumpe una descarga.
-
-### Corrección de Errores 🐛
-- Solucionado un problema donde el botón de descarga pensaba que una descarga seguía activa después de una cancelación del usuario.
-- Solucionados posibles archivos fantasma que quedaban si el usuario navegaba fuera durante la fase de configuración inicial.
-- Solucionado un bug visual donde el título de la pestaña mostraba porcentajes duplicados (ej. `[16%] [0%] Título`) debido al manejo recursivo de listas de reproducción.
