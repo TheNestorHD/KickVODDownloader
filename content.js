@@ -720,7 +720,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 console.log('Variant Analysis Results:', variantAnalysis);
                 console.log(`Selected Best Variant: ${bestVariant.resolution} (${bestVariant.bandwidth}bps) - Duration: ${bestVariant.duration}s`);
 
-                return downloadSegments(bestVariant.url, btn, videoDurationMs, startSeconds, endSeconds);
+                return downloadSegments(bestVariant.url, btn, videoDurationMs, startSeconds, endSeconds, handle);
             }
             
             // Fallback to simple search if parsing failed
@@ -728,7 +728,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             if (m3u8Match) {
                 let newUrl = m3u8Match.startsWith('http') ? m3u8Match : baseUrl + m3u8Match;
                 console.log(`Fallback: Found .m3u8 link, redirecting to: ${newUrl}`);
-                return downloadSegments(newUrl, btn, videoDurationMs, startSeconds, endSeconds);
+                return downloadSegments(newUrl, btn, videoDurationMs, startSeconds, endSeconds, handle);
             }
         }
 
