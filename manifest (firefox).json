@@ -18,13 +18,13 @@
   ],
   "content_scripts": [
     {
-      "matches": ["https://kick.com/*", "https://dashboard.kick.com/*"],
+      "matches": ["https://kick.com/*"],
       "js": ["mux.min.js", "content.js"],
       "css": ["style.css"]
     }
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
   "action": {
     "default_popup": "popup.html",

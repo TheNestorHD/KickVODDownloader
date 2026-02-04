@@ -41,3 +41,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Stick to Memory Mode as fallback, but warn user (as requested).
     // Implementing full StreamSaver in MV3 inside an extension without an external server is very hacky/unstable.
 });
+
+// Handle Notification Requests
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'SHOW_NOTIFICATION') {
+        chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: message.title,
+            message: message.message,
+            priority: 2
+        });
+    }
+});

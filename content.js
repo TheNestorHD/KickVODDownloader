@@ -11,6 +11,60 @@ let cancelRequested = false;
 let originalPageTitle = '';
 const originalMediaStates = new Map();
 
+// --- Wake Lock / Inactivity Prevention ---
+// Keeps the tab active during critical operations (Download / Auto-DL monitoring)
+let wakeLockAudioContext = null;
+let wakeLockOscillator = null;
+let wakeLockCount = 0;
+
+function preventTabInactivity() {
+    wakeLockCount++;
+    // console.log(`[WakeLock] Acquired. Count: ${wakeLockCount}`);
+    
+    if (wakeLockAudioContext) return; // Already active
+
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+
+        wakeLockAudioContext = new AudioContext();
+        wakeLockOscillator = wakeLockAudioContext.createOscillator();
+        const gainNode = wakeLockAudioContext.createGain();
+        
+        // Ultra-low volume (effectively silent) but keeps audio thread active
+        gainNode.gain.value = 0.001; 
+        
+        wakeLockOscillator.connect(gainNode);
+        gainNode.connect(wakeLockAudioContext.destination);
+        wakeLockOscillator.start();
+        
+        // console.log('[WakeLock] Audio Context Started (Inactivity Prevention)');
+    } catch (e) {
+        console.error('[WakeLock] Failed to start:', e);
+    }
+}
+
+function allowTabInactivity() {
+    if (wakeLockCount > 0) wakeLockCount--;
+    // console.log(`[WakeLock] Released. Count: ${wakeLockCount}`);
+
+    if (wakeLockCount === 0 && wakeLockAudioContext) {
+        try {
+            if (wakeLockOscillator) {
+                wakeLockOscillator.stop();
+                wakeLockOscillator.disconnect();
+            }
+            wakeLockAudioContext.close();
+        } catch (e) {
+            console.error('[WakeLock] Cleanup error:', e);
+        }
+        wakeLockAudioContext = null;
+        wakeLockOscillator = null;
+        // console.log('[WakeLock] Audio Context Stopped');
+    }
+}
+// -----------------------------------------
+
 function mutePageAudio() {
     const media = document.querySelectorAll('video, audio');
     media.forEach(el => {
@@ -161,8 +215,22 @@ async function checkAndCleanup() {
     } catch (e) { console.error('Cleanup Check Error', e); }
 }
 
+function showFirstKickVisitAlert() {
+    if (location.hostname.startsWith('dashboard.')) return;
+    chrome.storage.local.get(['kvd_badge_alert_shown'], (result) => {
+        if (result.kvd_badge_alert_shown) return;
+        const message = [
+            'New features are available via the extension badge (icon). Pin the extension to the toolbar for quick access.',
+            'Hay funciones disponibles desde el badge (ícono) de la extensión. Ancla el ícono a la barra de extensiones para acceso rápido.'
+        ].join('\n\n');
+        alert(message);
+        chrome.storage.local.set({ kvd_badge_alert_shown: true });
+    });
+}
+
 // Run cleanup check on load
 checkAndCleanup();
+showFirstKickVisitAlert();
 
 // Cleanup on page reload/close
 const handleUnload = () => {
@@ -182,9 +250,26 @@ const handleUnload = () => {
 window.addEventListener('beforeunload', handleUnload);
 window.addEventListener('pagehide', handleUnload);
 
-// Listen for messages from background script (Navigation detection)
-// Removed navigation detection logic.
-// We now allow navigation while downloading.
+// Listen for messages from background script (Navigation detection) and Popup
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    // --- POPUP: Admin Check ---
+    if (request.type === 'CHECK_ADMIN') {
+        sendResponse({ isAdmin: isModerator() });
+        return true;
+    }
+    
+    // --- POPUP: Get Channel Slug ---
+    if (request.type === 'GET_CHANNEL_SLUG') {
+        sendResponse({ slug: getChannelSlug() });
+        return true;
+    }
+    
+    // --- POPUP: Send Chat ---
+    if (request.type === 'SEND_CHAT') {
+        sendChatMessage(request.message);
+        return true;
+    }
+});
 
 // Function to extract video ID from URL
 function getVideoId() {
@@ -201,22 +286,26 @@ function getVideoId() {
 // Function to fetch video data
 async function fetchVideoData(videoId) {
     try {
-        const response = await fetch(`https://kick.com/api/v1/video/${videoId}`);
-        if (!response.ok) throw new Error('Network response was not ok');
+        const response = await fetch(`https://kick.com/api/v1/video/${videoId}`, {
+            credentials: 'include'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         console.log('API Video Data:', data); // Log full API response for debugging
         return data;
     } catch (error) {
         console.error('Error fetching video data:', error);
-        return null;
+        return { error: error.message };
     }
 }
 
 // Helper to update button state
 function updateButton(btn, text, disabled = false, progress = null) {
     btn.disabled = disabled;
+    const isThumb = btn.classList.contains('kvd-thumb-btn');
+
     if (progress !== null) {
-        btn.textContent = `${text} (${progress}%)`;
+        btn.textContent = isThumb ? `${progress}%` : `${text} (${progress}%)`;
         btn.style.background = `linear-gradient(to right, #53fc18 ${progress}%, #333 ${progress}%)`;
         btn.style.color = progress > 50 ? '#000' : '#fff';
     } else {
@@ -244,9 +333,17 @@ function createDownloadSvg() {
 
 function setButtonToDownload(btn) {
     btn.textContent = '';
-    btn.appendChild(createDownloadSvg());
-    btn.appendChild(document.createTextNode('\n        Download MP4\n    '));
+    
+    if (btn.classList.contains('kvd-thumb-btn')) {
+        btn.innerHTML = '<span>⬇</span>';
+        btn.title = 'Download';
+    } else {
+        btn.appendChild(createDownloadSvg());
+        btn.appendChild(document.createTextNode('\n        Download\n    '));
+    }
+    
     btn.style.background = '';
+    btn.disabled = false;
 }
 
 // Helper to format bytes
@@ -273,8 +370,8 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '', currentB
         overlay.appendChild(h2);
 
         const p = document.createElement('p');
+        p.className = 'kvd-overlay-warning';
         p.textContent = 'Please do not close this tab or navigate away.\nPor favor, no cierres esta pestaña ni navegues a otra página.';
-        p.style.whiteSpace = 'pre-wrap';
         overlay.appendChild(p);
 
         const container = document.createElement('div');
@@ -336,7 +433,7 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '', currentB
         overlay.appendChild(disclaimer);
 
         const cancelBtn = document.createElement('button');
-        cancelBtn.className = 'cancel-btn';
+        cancelBtn.className = 'kvd-btn-cancel-overlay';
         cancelBtn.textContent = 'Cancel Download / Cancelar';
         overlay.appendChild(cancelBtn);
         document.body.appendChild(overlay);
@@ -346,7 +443,7 @@ function updateOverlay(progress, text = 'Downloading...', etaText = '', currentB
         mutePageAudio();
 
         // Bind cancel button
-        overlay.querySelector('.cancel-btn').addEventListener('click', async () => {
+        overlay.querySelector('.kvd-btn-cancel-overlay').addEventListener('click', async () => {
              if (confirm('Are you sure you want to cancel? / ¿Seguro que quieres cancelar?')) {
                  cancelRequested = true;
                  overlay.querySelector('h2').textContent = 'Cancelling...';
@@ -456,9 +553,71 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
             return null;
         };
 
+        // 0. Check for btrt injection (Windows Bitrate Fix)
+        const moovCheck = findBox(0, view.byteLength, 'moov');
+        if (moovCheck) {
+            let trakPos = moovCheck.offset + 8;
+            while (trakPos < moovCheck.offset + moovCheck.size) {
+                const trak = readBox(trakPos);
+                if (trak && trak.type === 'trak') {
+                    const mdia = findBox(trak.offset + 8, trak.offset + trak.size, 'mdia');
+                    if (mdia) {
+                        const minf = findBox(mdia.offset + 8, mdia.offset + mdia.size, 'minf');
+                        if (minf) {
+                            const stbl = findBox(minf.offset + 8, minf.offset + minf.size, 'stbl');
+                            if (stbl) {
+                                const stsd = findBox(stbl.offset + 8, stbl.offset + stbl.size, 'stsd');
+                                if (stsd) {
+                                    const avc1 = findBox(stsd.offset + 12, stsd.offset + stsd.size, 'avc1');
+                                    if (avc1) {
+                                        const childrenStart = avc1.offset + 8 + 78;
+                                        const btrt = findBox(childrenStart, avc1.offset + avc1.size, 'btrt');
+                                        
+                                        if (!btrt) {
+                                            console.log('[Patch] btrt atom missing, injecting for Windows compatibility...');
+                                            const newSize = initSegment.byteLength + 20;
+                                            const newInit = new Uint8Array(newSize);
+                                            const newView = new DataView(newInit.buffer);
+                                            
+                                            // Insert at end of avc1
+                                            const insertPos = avc1.offset + avc1.size;
+                                            
+                                            // Copy before
+                                            newInit.set(initSegment.subarray(0, insertPos), 0);
+                                            
+                                            // btrt (20 bytes)
+                                            newView.setUint32(insertPos, 20);
+                                            newView.setUint8(insertPos + 4, 0x62); // b
+                                            newView.setUint8(insertPos + 5, 0x74); // t
+                                            newView.setUint8(insertPos + 6, 0x72); // r
+                                            newView.setUint8(insertPos + 7, 0x74); // t
+                                            // Data will be filled in recursive call
+                                            
+                                            // Copy after
+                                            newInit.set(initSegment.subarray(insertPos), insertPos + 20);
+                                            
+                                            // Update sizes of ancestors
+                                            const ancestors = [moovCheck, trak, mdia, minf, stbl, stsd, avc1];
+                                            ancestors.forEach(box => {
+                                                const oldSize = view.getUint32(box.offset);
+                                                newView.setUint32(box.offset, oldSize + 20);
+                                            });
+                                            
+                                            return patchMp4Header(newInit, durationMs, avgBitrate);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                trakPos += trak.size;
+            }
+        }
+
         // 1. Find moov
         const moov = findBox(0, view.byteLength, 'moov');
-        if (!moov) return;
+        if (!moov) return initSegment;
 
         // 2. Patch mvhd (Movie Header)
         const mvhd = findBox(moov.offset + 8, moov.offset + moov.size, 'mvhd');
@@ -466,22 +625,16 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
         
         if (mvhd) {
             const version = view.getUint8(mvhd.offset + 8);
-            // 32-bit: v(1)+f(3)+cr(4)+mod(4)+scale(4)+dur(4) -> scale at 12, dur at 16
-            // 64-bit: v(1)+f(3)+cr(8)+mod(8)+scale(4)+dur(8) -> scale at 20, dur at 24
             const timescaleOffset = mvhd.offset + 8 + (version === 0 ? 12 : 20);
             const durationOffset = timescaleOffset + 4;
             
             globalTimescale = view.getUint32(timescaleOffset);
             const durationUnits = Math.round((durationMs / 1000) * globalTimescale);
             
-            // console.log(`[Patch] mvhd: Version=${version}, Timescale=${globalTimescale}, Duration=${durationUnits}`);
-            
             if (version === 0) {
                 view.setUint32(durationOffset, durationUnits);
             } else {
-                 // High 32 bits
                  view.setUint32(durationOffset, Math.floor(durationUnits / 4294967296));
-                 // Low 32 bits
                  view.setUint32(durationOffset + 4, durationUnits % 4294967296);
             }
         }
@@ -498,9 +651,7 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
                     const version = view.getUint8(tkhd.offset + 8);
                     const durationOffset = tkhd.offset + 8 + (version === 0 ? 20 : 28);
                     
-                    // tkhd duration is in mvhd timescale (globalTimescale)
                     const durationUnits = Math.round((durationMs / 1000) * globalTimescale);
-                    // console.log(`[Patch] tkhd: Duration=${durationUnits}`);
 
                     if (version === 0) {
                         view.setUint32(durationOffset, durationUnits);
@@ -522,8 +673,6 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
                          const localTimescale = view.getUint32(timescaleOffset);
                          const durationUnits = Math.round((durationMs / 1000) * localTimescale);
                          
-                         // console.log(`[Patch] mdhd: Timescale=${localTimescale}, Duration=${durationUnits}`);
-
                          if (version === 0) {
                              view.setUint32(durationOffset, durationUnits);
                          } else {
@@ -539,23 +688,15 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
                         if (stbl) {
                             const stsd = findBox(stbl.offset + 8, stbl.offset + stbl.size, 'stsd');
                             if (stsd) {
-                                // stsd has 8 bytes header + 4 bytes count. Entries start at offset+12
                                 const avc1 = findBox(stsd.offset + 12, stsd.offset + stsd.size, 'avc1');
                                 if (avc1) {
-                                    // avc1 header (8) + reserved(6) + dataRefIdx(2) + pre_defined(2) + reserved(2) + pre_defined(12) 
-                                    // + width(2) + height(2) + horiz_res(4) + vert_res(4) + reserved(4) + frame_count(2) 
-                                    // + compressorname(32) + depth(2) + pre_defined(2) = 78 bytes of VisualSampleEntry fields
-                                    // Children start after that.
                                     const childrenStart = avc1.offset + 8 + 78;
                                     const btrt = findBox(childrenStart, avc1.offset + avc1.size, 'btrt');
                                     if (btrt) {
-                                        // btrt: size(4) + type(4) + bufferSizeDB(4) + maxBitrate(4) + avgBitrate(4)
                                         const maxBitrateOffset = btrt.offset + 12;
                                         const avgBitrateOffset = btrt.offset + 16;
                                         
-                                        // Use calculated bitrate if available, otherwise fallback to reasonable defaults
                                         const finalAvgBitrate = avgBitrate > 0 ? avgBitrate : 8000000;
-                                        // Max bitrate = Avg + 50% buffer, or at least 12Mbps
                                         const finalMaxBitrate = Math.max(Math.round(finalAvgBitrate * 1.5), 12000000);
                                         
                                         view.setUint32(maxBitrateOffset, finalMaxBitrate);
@@ -570,17 +711,40 @@ function patchMp4Header(initSegment, durationMs, avgBitrate = 0) {
             }
             trakPos += box.size;
         }
-
+        
+        return initSegment;
     } catch (e) {
         console.error('Error patching MP4 headers:', e);
+        return initSegment;
     }
 }
 
-async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null) {
+// Helper to send desktop notifications (only if tab is hidden)
+function sendNotification(title, message) {
+    if (document.hidden) {
+        chrome.runtime.sendMessage({
+            type: 'SHOW_NOTIFICATION',
+            title: title,
+            message: message
+        }).catch(e => console.log('Notification failed:', e));
+    }
+}
+
+async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null, forceMemory = false, explicitVideoId = null) {
     try {
+        // Check for Audio Only mode (passed via URL hash)
+        let isAudioOnly = false;
+        if (streamUrl.endsWith('#audio_only')) {
+            isAudioOnly = true;
+            streamUrl = streamUrl.replace('#audio_only', '');
+            console.log('Audio Only Mode Detected (M4A/AAC)');
+        }
+
         isDownloading = true;
+        preventTabInactivity(); // Prevent tab sleep during download
         cancelRequested = false;
-        
+        currentDownloadVideoId = explicitVideoId || getVideoId(); // Use explicit ID if provided
+
         // Save original title only if not already saved (prevents recursion issues)
         if (!originalPageTitle) {
             originalPageTitle = document.title;
@@ -590,17 +754,20 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         // We must ask for the file handle immediately, before any network requests (fetch)
         let handle = preOpenedHandle;
         
-        // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle
-        if (!handle && typeof window.showSaveFilePicker === 'function') {
+        // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle AND not forced memory mode
+        if (!forceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
              try {
                  // Suggest filename
-                 const suggestedName = `kick-vod-${getVideoId() || 'video'}.mp4`;
+                 const ext = isAudioOnly ? 'm4a' : 'mp4';
+                 const desc = isAudioOnly ? 'M4A Audio' : 'MP4 Video';
+                 const mime = isAudioOnly ? { 'audio/mp4': ['.m4a'] } : { 'video/mp4': ['.mp4'] };
+                 const suggestedName = `kick-vod-${explicitVideoId || getVideoId() || 'video'}.${ext}`;
                  
                  handle = await window.showSaveFilePicker({
                     suggestedName: suggestedName,
                     types: [{
-                        description: 'MP4 Video',
-                        accept: { 'video/mp4': ['.mp4'] },
+                        description: desc,
+                        accept: mime,
                     }],
                 });
                 
@@ -615,6 +782,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  // User cancelled or error
                  console.log('User cancelled save picker or error:', pickerError);
                  isDownloading = false;
+                 allowTabInactivity();
                  setButtonToDownload(btn);
                  return; // Stop execution
              }
@@ -720,7 +888,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 console.log('Variant Analysis Results:', variantAnalysis);
                 console.log(`Selected Best Variant: ${bestVariant.resolution} (${bestVariant.bandwidth}bps) - Duration: ${bestVariant.duration}s`);
 
-                return downloadSegments(bestVariant.url, btn, videoDurationMs, startSeconds, endSeconds, handle);
+                let targetUrl = bestVariant.url;
+                if (isAudioOnly) targetUrl += '#audio_only';
+
+                return downloadSegments(targetUrl, btn, videoDurationMs, startSeconds, endSeconds, handle, forceMemory);
             }
             
             // Fallback to simple search if parsing failed
@@ -728,7 +899,8 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             if (m3u8Match) {
                 let newUrl = m3u8Match.startsWith('http') ? m3u8Match : baseUrl + m3u8Match;
                 console.log(`Fallback: Found .m3u8 link, redirecting to: ${newUrl}`);
-                return downloadSegments(newUrl, btn, videoDurationMs, startSeconds, endSeconds, handle);
+                if (isAudioOnly) newUrl += '#audio_only';
+                return downloadSegments(newUrl, btn, videoDurationMs, startSeconds, endSeconds, handle, forceMemory);
             }
         }
 
@@ -952,7 +1124,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                     ramWarning.style.padding = '10px';
                     ramWarning.style.border = '1px solid #ffaa00';
                     ramWarning.style.backgroundColor = 'rgba(255, 170, 0, 0.1)';
-                    ramWarning.textContent = 'ℹ️ INFO: Compatibility Mode / Modo Compatibilidad\nYour browser does not support direct disk saving. The video will be stored in temporary storage and assembled at the end.\nPlease ensure you have enough free disk space (at least double the video size).\n\nℹ️ INFO: Modo Compatibilidad\nTu navegador no soporta guardado directo. El video se guardará en almacenamiento temporal y se ensamblará al final.\nAsegúrate de tener espacio libre (al menos el doble del tamaño del video).';
+                    ramWarning.textContent = 'ℹ️ INFO: Cache Write Mode / Modo de escritura en caché\nThe VOD may take up to double its size in your storage while downloading.\n\nEl VOD puede ocupar hasta el doble de su peso en tu almacenamiento mientras se descarga.';
                     ramWarning.style.whiteSpace = 'pre-wrap';
                     
                     progressBarContainer.parentNode.insertBefore(ramWarning, progressBarContainer.nextSibling);
@@ -968,7 +1140,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         // 3. Initialize Transmuxer
         // We set keepOriginalTimestamps to false (default) to ensure the video starts at 0
         // instead of the original stream timestamp (which could be hours into the recording).
-        const transmuxer = new muxjs.mp4.Transmuxer({keepOriginalTimestamps: false});
+        // If Audio Only, set remux: false to separate streams and we will only capture audio
+        const transmuxer = new muxjs.mp4.Transmuxer({
+            keepOriginalTimestamps: false,
+            remux: !isAudioOnly // If isAudioOnly is true, remux is false (separate streams)
+        });
+
         let initSegmentWritten = false;
         // Capture first segment duration for bitrate calculation
         const firstSegmentDuration = segmentDurations.length > 0 ? segmentDurations[0] : 0;
@@ -979,6 +1156,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         let fileWriteChain = Promise.resolve();
 
         transmuxer.on('data', async (segment) => {
+            // Filter: If Audio Only, ignore non-audio segments
+            if (isAudioOnly) {
+                if (segment.type !== 'audio') return;
+                console.log('Writing Audio-Only Segment:', segment);
+            }
+
             // Write init segment (ftyp + moov) only once
             if (!initSegmentWritten) {
                  let initSeg = new Uint8Array(segment.initSegment);
@@ -995,7 +1178,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  const targetDurationMs = (calculatedDuration > 0) ? calculatedDuration * 1000 : videoDurationMs;
                  
                  if (targetDurationMs > 0) {
-                     patchMp4Header(initSeg, targetDurationMs, estimatedBitrate);
+                     initSeg = patchMp4Header(initSeg, targetDurationMs, estimatedBitrate);
                  } else {
                      console.warn('Invalid video duration, skipping header patch');
                  }
@@ -1050,62 +1233,99 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
             }
 
-            try {
-                const segRes = await fetch(segments[i]);
-                if (!segRes.ok) throw new Error(`Failed to fetch segment ${i}`);
-                const segData = await segRes.arrayBuffer();
-                
-                // Track total bytes
-                totalBytes += segData.byteLength;
-                
-                // Push to transmuxer
-                // Fix for Firefox "Permission denied to access property constructor"
-                // Clone data into a new Uint8Array created explicitly in this scope
-                const sourceBytes = new Uint8Array(segData);
-                const cleanBytes = new Uint8Array(sourceBytes.length);
-                cleanBytes.set(sourceBytes);
+            let attempt = 0;
+            const maxRetries = 20; // Increased retries for robustness
+            let success = false;
 
-                transmuxer.push(cleanBytes);
-                transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
+            while (attempt < maxRetries && !success) {
+                try {
+                    if (cancelRequested) throw new Error('Download cancelled');
 
-                // Update progress
-                const progress = Math.round(((i + 1) / segments.length) * 100);
-                
-                // Calculate instantaneous speed and ETA every ~1s or when progress changes
-                const now = Date.now();
-                const timeDiff = (now - lastSpeedTime) / 1000; // seconds
-                
-                // Calculate speed every second regardless of progress change
-                if (timeDiff >= 1) { 
-                     const bytesDiff = totalBytes - lastSpeedBytes;
-                     currentSpeed = bytesDiff / timeDiff; // bytes per second
-                     lastSpeedTime = now;
-                     lastSpeedBytes = totalBytes;
-                }
-
-                // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
-                if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
-                    lastProgress = Math.max(lastProgress, progress); // Keep max progress
-                    lastUiUpdate = now;
+                    const segRes = await fetch(segments[i]);
+                    if (!segRes.ok) {
+                        // If 404, it might be permanent, but sometimes CDNs are weird. We retry.
+                        throw new Error(`Failed to fetch segment ${i}, status: ${segRes.status}`);
+                    }
+                    const segData = await segRes.arrayBuffer();
                     
-                    // Calculate ETA
-                    const elapsedTime = (Date.now() - startTime) / 1000; // seconds
-                    let etaText = 'Calculating time...';
+                    // Track total bytes
+                    totalBytes += segData.byteLength;
                     
-                    if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
-                        const rate = (i + 1) / elapsedTime; // segments per second
-                        const remainingSegments = segments.length - (i + 1);
-                        const etaSeconds = remainingSegments / rate;
-                        etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
+                    // Push to transmuxer
+                    // Fix for Firefox "Permission denied to access property constructor"
+                    // Clone data into a new Uint8Array created explicitly in this scope
+                    const sourceBytes = new Uint8Array(segData);
+                    const cleanBytes = new Uint8Array(sourceBytes.length);
+                    cleanBytes.set(sourceBytes);
+
+                    transmuxer.push(cleanBytes);
+                    transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
+
+                    success = true;
+
+                    // Update progress
+                    const progress = Math.round(((i + 1) / segments.length) * 100);
+                    
+                    // Calculate instantaneous speed and ETA every ~1s or when progress changes
+                    const now = Date.now();
+                    const timeDiff = (now - lastSpeedTime) / 1000; // seconds
+                    
+                    // Calculate speed every second regardless of progress change
+                    if (timeDiff >= 1) { 
+                         const bytesDiff = totalBytes - lastSpeedBytes;
+                         currentSpeed = bytesDiff / timeDiff; // bytes per second
+                         lastSpeedTime = now;
+                         lastSpeedBytes = totalBytes;
                     }
 
-                    updateButton(btn, 'Downloading...', true, progress);
-                    updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
-                }
+                    // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
+                    if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
+                        lastProgress = Math.max(lastProgress, progress); // Keep max progress
+                        lastUiUpdate = now;
+                        
+                        // Calculate ETA
+                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+                        let etaText = 'Calculating time...';
+                        
+                        if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
+                            const rate = (i + 1) / elapsedTime; // segments per second
+                            const remainingSegments = segments.length - (i + 1);
+                            const etaSeconds = remainingSegments / rate;
+                            etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
+                        }
 
-            } catch (err) {
-                console.error(`Error processing segment ${i}:`, err);
-                // Continue? or abort? Let's try to continue
+                        updateButton(btn, 'Downloading...', true, progress);
+                        updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
+                    }
+
+                } catch (err) {
+                    if (err.message.includes('Download cancelled')) throw err;
+
+                    attempt++;
+                    console.error(`Error processing segment ${i} (Attempt ${attempt}/${maxRetries}):`, err);
+                    
+                    if (attempt >= maxRetries) {
+                        console.error(`Max retries reached for segment ${i}. Skipping... (Video might be glitchy)`);
+                        // We skip this segment instead of failing the whole download. 
+                        // The video will have a small jump/glitch but it's better than nothing.
+                        break; 
+                    }
+
+                    // Wait before retry (Exponential Backoff: 1s, 2s, 4s, 8s... max 15s)
+                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
+                    const jitter = Math.random() * 500;
+                    const delay = backoff + jitter;
+                    
+                    // Show retry status in overlay
+                    updateOverlay(lastProgress, 
+                        `Connection Issue / Problema de Conexión`, 
+                        `Retrying segment ${i}/${segments.length} (Attempt ${attempt}/${maxRetries})...\nWaiting ${Math.round(delay/1000)}s`, 
+                        totalBytes, 
+                        0 // Speed 0 while waiting
+                    );
+
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
             }
         }
 
@@ -1150,12 +1370,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  alert('Error: Download seems empty. Please check console.');
             }
             
-            const blob = new Blob(chunks, { type: 'video/mp4' });
+            const blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
+            const blob = new Blob(chunks, { type: blobType });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `kick-vod-${getVideoId() || 'video'}.mp4`;
+            const ext = isAudioOnly ? 'm4a' : 'mp4';
+            a.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
             document.body.appendChild(a);
             a.click();
 
@@ -1172,9 +1394,11 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 // window.location.reload();
             }, 30000); // Increased timeout to give time for large file assembly/download start
         }
-
+        
+        sendNotification('Download Complete / Descarga Completa', `The VOD "${getVideoId() || 'video'}" has been downloaded successfully.`);
         updateButton(btn, 'Download Complete!', false);
         isDownloading = false;
+        allowTabInactivity();
         cancelRequested = false;
         currentDownloadVideoId = null;
         currentDownloadPath = null;
@@ -1182,6 +1406,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         currentWritable = null;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
+        
+        // Restore audio after successful download (before reload)
+        restorePageAudio();
+
         setTimeout(async () => {
              setButtonToDownload(btn);
              // Force reload to clear memory/state and prevent bugs
@@ -1202,20 +1430,25 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         currentDownloadVideoId = null;
         currentDownloadPath = null;
         clearHandleFromDB();
+        
+        // Restore audio on error
+        restorePageAudio();
 
         console.error('Download failed:', error);
         
         // Only alert if it's not a user cancellation
         if (error.name === 'AbortError' || error.message.includes('user aborted') || error.message.includes('cancelled by user')) {
              updateButton(btn, 'Cancelled', false);
-             setTimeout(() => {
-                  setButtonToDownload(btn);
-             }, 2000);
+             // Reload immediately as requested
+             console.log('Download cancelled. Reloading page to cleanup...');
+             window.location.reload();
         } else {
+            sendNotification('Download Failed / Error de Descarga', `Error: ${error.message}`);
             alert('Download failed: ' + error.message);
             updateButton(btn, 'Error', false);
         }
         isDownloading = false;
+        allowTabInactivity();
         cancelRequested = false;
         
         removeOverlay();
@@ -1227,6 +1460,9 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     // Remove existing modal if any
     const existingModal = document.querySelector('.kvd-modal-overlay');
     if (existingModal) existingModal.remove();
+
+    // Mute video to prevent audio interference while deciding
+    mutePageAudio();
 
     const durationSeconds = Math.floor(durationMs / 1000);
     
@@ -1249,6 +1485,138 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     title.className = 'kvd-modal-title';
     title.textContent = 'Download Options / Opciones';
     content.appendChild(title);
+
+    // --- Quality Selector ---
+    const qualityContainer = document.createElement('div');
+    qualityContainer.style.cssText = 'margin-bottom: 15px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 5px;';
+    
+    const qualityLabel = document.createElement('label');
+    qualityLabel.textContent = 'Quality / Calidad:';
+    qualityLabel.style.cssText = 'color: #ccc; font-size: 14px; font-weight: bold;';
+    qualityContainer.appendChild(qualityLabel);
+
+    const qualitySelect = document.createElement('select');
+    qualitySelect.id = 'kvd-quality-select';
+    qualitySelect.style.cssText = 'background: #222; color: #fff; border: 1px solid #444; padding: 8px; border-radius: 4px; font-size: 14px; width: 80%; cursor: pointer; outline: none;';
+    qualitySelect.innerHTML = '<option value="">Loading / Cargando...</option>';
+    qualitySelect.disabled = true;
+    qualityContainer.appendChild(qualitySelect);
+
+    content.appendChild(qualityContainer);
+
+    // State for selected URL
+    let selectedVariantUrl = null;
+    let masterPlaylistUrl = null;
+
+    // Fetch Qualities Logic
+    (async () => {
+        try {
+            // Check if we already have data from the button click? 
+            // We don't have it passed here, so we fetch. It's cached usually.
+            const data = await fetchVideoData(videoId);
+            if (!data || !data.source) {
+                qualitySelect.innerHTML = '<option value="">Error: No Source</option>';
+                return;
+            }
+            masterPlaylistUrl = data.source;
+
+            // Fetch Playlist
+            const response = await fetch(masterPlaylistUrl);
+            const text = await response.text();
+            const lines = text.split('\n');
+
+            const variants = [];
+            
+            // Robust Base URL calculation
+            let baseUrl;
+            try {
+                baseUrl = new URL('.', masterPlaylistUrl).href;
+            } catch (e) {
+                baseUrl = masterPlaylistUrl.substring(0, masterPlaylistUrl.lastIndexOf('/') + 1);
+            }
+
+            if (text.includes('EXT-X-STREAM-INF')) {
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].includes('EXT-X-STREAM-INF')) {
+                        const bwMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+                        const bw = bwMatch ? parseInt(bwMatch[1]) : 0;
+                        const resMatch = lines[i].match(/RESOLUTION=(\d+x\d+)/);
+                        const res = resMatch ? resMatch[1] : 'Audio Only'; // Fallback if no resolution (Audio)
+                        
+                        let j = i + 1;
+                        while (j < lines.length && lines[j].startsWith('#')) j++;
+                        if (j < lines.length && lines[j].trim().length > 0) {
+                            let url = lines[j].trim();
+                            // Robust URL resolution
+                            if (!url.startsWith('http')) {
+                                try {
+                                    url = new URL(url, baseUrl).href;
+                                } catch (e) {
+                                    url = baseUrl + url;
+                                }
+                            }
+                            variants.push({ bandwidth: bw, resolution: res, url: url });
+                        }
+                    }
+                }
+            }
+
+            if (variants.length > 0) {
+                // Sort: High Bandwidth first
+                variants.sort((a, b) => b.bandwidth - a.bandwidth);
+
+                qualitySelect.innerHTML = '';
+                
+                // Add variants
+                variants.forEach((v, index) => {
+                    const opt = document.createElement('option');
+                    
+                    const kbps = Math.round(v.bandwidth / 1000);
+                    opt.textContent = `${v.resolution} (${kbps} kbps)`;
+                    
+                    if (index === 0) {
+                        opt.textContent += ' (Best/Mejor)';
+                        opt.selected = true;
+                        // Use Master Playlist for "Best" to allow smart selection/fallback in downloadSegments
+                        opt.value = masterPlaylistUrl; 
+                        selectedVariantUrl = masterPlaylistUrl;
+                    } else {
+                        opt.value = v.url;
+                    }
+                    
+                    qualitySelect.appendChild(opt);
+                });
+                
+                // Add "Solo Audio (M4A)" option (User Request)
+                // Uses 360p or lowest quality variant as source, strips video track
+                const audioCandidate = variants.find(v => v.resolution && v.resolution.includes('360')) || variants[variants.length - 1];
+                if (audioCandidate) {
+                    const opt = document.createElement('option');
+                    opt.textContent = 'Solo Audio (M4A) - Experimental';
+                    opt.value = audioCandidate.url + '#audio_only';
+                    opt.style.color = '#53fc18'; // Highlight
+                    qualitySelect.appendChild(opt);
+                }
+                
+                qualitySelect.disabled = false;
+                
+                // Update selected on change
+                qualitySelect.onchange = () => {
+                    selectedVariantUrl = qualitySelect.value;
+                };
+
+            } else {
+                // No variants (single stream?)
+                qualitySelect.innerHTML = '<option value="">Default (Single Stream)</option>';
+                selectedVariantUrl = masterPlaylistUrl; // Fallback to master
+            }
+
+        } catch (e) {
+            console.error('Error fetching qualities:', e);
+            qualitySelect.innerHTML = '<option value="">Auto (Default)</option>';
+            selectedVariantUrl = null; 
+        }
+    })();
     
     // Main Options
     const mainOptions = document.createElement('div');
@@ -1450,7 +1818,11 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     const close = () => {
         modal.remove();
         btn.disabled = false;
-        btn.textContent = 'Download MP4';
+        btn.textContent = 'Download'; // Simplified text
+        setButtonToDownload(btn); // Re-apply SVG and correct structure
+        
+        // Restore audio if download NOT started
+        restorePageAudio();
     };
 
     closeModalBtn.onclick = close;
@@ -1461,12 +1833,22 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     // Download All
     downloadAllBtn.onclick = async () => {
         modal.remove();
-        const videoData = await fetchVideoData(videoId); // Fetch again to get fresh source
-        if (videoData && videoData.source) {
-             await downloadSegments(videoData.source, btn, videoData.duration, 0, -1);
+        // Do NOT restore audio here, downloadSegments handles it after download finishes
+        
+        let sourceUrl = selectedVariantUrl;
+        
+        if (!sourceUrl) {
+            // Fallback if selector failed or logic didn't run
+            const videoData = await fetchVideoData(videoId);
+            if (videoData) sourceUrl = videoData.source;
+        }
+
+        if (sourceUrl) {
+             await downloadSegments(sourceUrl, btn, durationMs, 0, -1, null, false, videoId);
         } else {
              alert('Could not fetch video source');
              btn.disabled = false;
+             restorePageAudio(); // Restore if error
         }
     };
 
@@ -1504,18 +1886,413 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
 
         modal.remove();
         
-        const videoData = await fetchVideoData(videoId);
-        if (videoData && videoData.source) {
+        let sourceUrl = selectedVariantUrl;
+        
+        if (!sourceUrl) {
+            const videoData = await fetchVideoData(videoId);
+            if (videoData) sourceUrl = videoData.source;
+        }
+        
+        if (sourceUrl) {
              // Pass start/end in seconds
-             await downloadSegments(videoData.source, btn, videoData.duration, startSeconds, endSeconds);
+             await downloadSegments(sourceUrl, btn, durationMs, startSeconds, endSeconds, null, false, videoId);
         } else {
              alert('Could not fetch video source');
              btn.disabled = false;
+             restorePageAudio(); // Restore if error
         }
     };
 }
 
+// --- STREAMER MODE (AUTO-DOWNLOAD) ---
+let isStreamerModeEnabled = false;
+let streamEndDetected = false;
+
+function isModerator() {
+    // Dashboard: Always true (Access restricted to mods/streamers anyway)
+    if (window.location.hostname === 'dashboard.kick.com') {
+        return true;
+    }
+    const slug = getChannelSlug();
+    const adminChannels = JSON.parse(localStorage.getItem('kvd_admin_channels') || '[]');
+    return !!document.querySelector('a[href*="/moderator"]') || adminChannels.includes(slug);
+}
+
+function getChannelSlug() {
+    // Dashboard support: /moderator/slug
+    if (window.location.hostname === 'dashboard.kick.com') {
+        const match = window.location.pathname.match(/\/moderator\/([^\/]+)/);
+        if (match) return match[1];
+    }
+
+    const parts = window.location.pathname.split('/').filter(p => p);
+    if (parts.length === 1 && parts[0] !== 'video' && parts[0] !== 'videos') {
+        return parts[0];
+    }
+    return null;
+}
+
+// Check for pending auto-download on load (Post-Reload Logic)
+async function checkAutoDownloadTrigger() {
+    if (localStorage.getItem('kvd_auto_dl_pending') === 'true') {
+        console.log('[Streamer Mode] Pending auto-download detected. Starting process...');
+        localStorage.removeItem('kvd_auto_dl_pending');
+        
+        const slug = localStorage.getItem('kvd_channel_slug') || getChannelSlug();
+        if (!slug) return;
+
+        // Floating Status UI
+        const statusDiv = document.createElement('div');
+        statusDiv.style.cssText = 'position: fixed; top: 80px; right: 20px; background: rgba(0,0,0,0.9); color: #53fc18; padding: 20px; border-radius: 8px; z-index: 99999; font-family: "Inter", sans-serif; border: 2px solid #53fc18; box-shadow: 0 0 20px rgba(83, 252, 24, 0.3); font-size: 14px; max-width: 300px;';
+        statusDiv.innerHTML = '<strong>🚀 Auto-DL Active</strong><br>Waiting for VOD generation (2m)...<br>Esperando generación del VOD (2m)...';
+        document.body.appendChild(statusDiv);
+
+        // Wait 2 minutes for VOD to be generated by Kick backend
+        await new Promise(resolve => {
+            let secondsLeft = 120;
+            const timer = setInterval(() => {
+                secondsLeft--;
+                statusDiv.innerHTML = `<strong>🚀 Auto-DL Active</strong><br>Waiting for VOD generation...<br>Esperando generación del VOD...<br>⏱️ ${secondsLeft}s`;
+                if (secondsLeft <= 0) {
+                    clearInterval(timer);
+                    resolve();
+                }
+            }, 1000);
+        });
+
+        statusDiv.innerHTML = '<strong>🚀 Auto-DL Active</strong><br>Searching for latest VOD...<br>Buscando último VOD...';
+
+        try {
+            // Fetch Channel API to find UUID
+            const response = await fetch(`https://kick.com/api/v1/channels/${slug}`);
+            if (!response.ok) throw new Error('Channel API failed');
+            
+            const data = await response.json();
+            const previousStreams = data.previous_livestreams;
+            
+            if (previousStreams && previousStreams.length > 0) {
+                const latestStream = previousStreams[0];
+                const videoId = latestStream.video.uuid; // Use UUID
+                
+                statusDiv.innerHTML = `<strong>🚀 Auto-DL Active</strong><br>VOD Found! (${videoId})<br>Getting Metadata...`;
+                
+                const videoData = await fetchVideoData(videoId);
+                if (videoData && videoData.source) {
+                    statusDiv.innerHTML = '<strong>🚀 Auto-DL Active</strong><br>Starting Download...<br>Iniciando Descarga...';
+                    
+                    // Dummy button for downloader
+                    const dummyBtn = document.createElement('button');
+                    dummyBtn.style.display = 'none';
+                    document.body.appendChild(dummyBtn);
+
+                    // Start Download
+                    // Pass null for preOpenedHandle and true for forceMemory to bypass user gesture requirement
+                    await downloadSegments(videoData.source, dummyBtn, videoData.duration, 0, -1, null, true);
+                    
+                    statusDiv.innerHTML = '<strong>✅ Auto-DL Started!</strong><br>Using Memory Mode (No interaction required).<br>Modo Memoria activo.';
+                    setTimeout(() => statusDiv.remove(), 10000);
+                } else {
+                    throw new Error('Video source not found');
+                }
+            } else {
+                throw new Error('No VODs found in API');
+            }
+        } catch (e) {
+            console.error('[Streamer Mode] Error:', e);
+            statusDiv.innerHTML = `<strong>❌ Auto-DL Error</strong><br>${e.message}`;
+            statusDiv.style.color = '#ff4444';
+            statusDiv.style.borderColor = '#ff4444';
+        }
+    }
+}
+
+// Initialize check
+checkAutoDownloadTrigger();
+
+// Protection against accidental navigation/host redirects
+function handleStreamerModeExit(e) {
+    if (isStreamerModeEnabled && !streamEndDetected) {
+        e.preventDefault();
+        e.returnValue = 'Auto-Download is active. If you leave, it will be cancelled.\n\nLa Auto-Descarga está activa. Si sales, se cancelará.';
+        return e.returnValue;
+    }
+}
+
+// Inject Host Protection Script (SPA Navigation Blocker)
+function injectHostProtectionScript() {
+    if (document.getElementById('kvd-host-protection-script')) return;
+
+    const script = document.createElement('script');
+    script.id = 'kvd-host-protection-script';
+    script.textContent = `
+        (function() {
+            const originalPush = history.pushState;
+            const originalReplace = history.replaceState;
+
+            function shouldBlock() {
+                return document.body.getAttribute('data-kvd-auto-dl') === 'true';
+            }
+
+            history.pushState = function(...args) {
+                if (shouldBlock()) {
+                    console.log('[KVD Protection] Blocked history.pushState navigation (Host/Redirect prevented)');
+                    return; // Block navigation
+                }
+                return originalPush.apply(this, args);
+            };
+
+            history.replaceState = function(...args) {
+                if (shouldBlock()) {
+                    console.log('[KVD Protection] Blocked history.replaceState navigation (Host/Redirect prevented)');
+                    return; // Block navigation
+                }
+                return originalReplace.apply(this, args);
+            };
+            
+            console.log('[KVD] Host Protection Script Injected');
+        })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+}
+
+function injectStreamerModeUI() {
+    // Inject Protection Script immediately
+    injectHostProtectionScript();
+
+    // Check if already injected
+    if (document.getElementById('kvd-streamer-container')) return;
+
+    let target = null;
+    let insertPosition = 'after'; // 'after' or 'before' or 'append'
+
+    // Strategy 1: Dashboard Injection (Navbar)
+    if (window.location.hostname === 'dashboard.kick.com') {
+        // Look for the sticky navbar
+        const navbar = document.querySelector('nav.sticky.top-0');
+        if (navbar) {
+            // Center in navbar using absolute positioning
+            target = navbar;
+            insertPosition = 'append';
+
+            // --- VOD Button Injection (Dashboard Only) ---
+            if (!document.getElementById('kvd-dashboard-vod-btn') && navbar.children.length > 0) {
+                // Find right container (usually the last child)
+                const rightContainer = navbar.children[navbar.children.length - 1];
+                
+                if (rightContainer) {
+                     // Try to find the profile button (usually the last button or contains an image)
+                     const profileBtn = Array.from(rightContainer.querySelectorAll('button')).find(btn => btn.querySelector('img'));
+                     
+                     if (profileBtn) {
+                         const slug = getChannelSlug();
+                         if (slug) {
+                             const vodBtn = document.createElement('a');
+                             vodBtn.id = 'kvd-dashboard-vod-btn';
+                             vodBtn.href = `https://kick.com/${slug}/videos`;
+                             vodBtn.target = '_blank';
+                             vodBtn.title = 'Go to VODs / Ir a VODs';
+                             // Classes from Roadmap Line 26 + hover
+                             vodBtn.className = 'group relative box-border flex shrink-0 grow-0 select-none items-center justify-center gap-2 whitespace-nowrap rounded font-semibold ring-0 transition-all focus-visible:outline-none active:scale-[0.95] disabled:pointer-events-none [&_svg]:size-[1em] state-layer-surface bg-transparent text-white [&_svg]:fill-current hover:bg-surface-hover size-10 text-base leading-none';
+                             vodBtn.style.cssText = 'margin-right: 5px; text-decoration: none;';
+                             
+                             // Video Icon
+                             vodBtn.innerHTML = `
+                                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                                     <path d="M10 16.5l6-4.5-6-4.5v9zM12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>
+                                 </svg>
+                             `;
+                             
+                             rightContainer.insertBefore(vodBtn, profileBtn);
+                         }
+                     }
+                }
+            }
+        }
+    } 
+    // Strategy 2: Channel Page Injection (Search Bar)
+    else {
+        // Find Target: Search Bar Container (Top Nav)
+        // Strategy: Find input with placeholder 'Search' or 'Buscar'
+        const inputs = Array.from(document.querySelectorAll('input'));
+        const searchInput = inputs.find(i => 
+            i.placeholder && (i.placeholder.includes('Search') || i.placeholder.includes('Buscar'))
+        );
+
+        if (searchInput) {
+            // Go up to find the main flex container of the search bar
+            let parent = searchInput.parentElement;
+            // Try to find a parent that is likely the container (e.g., div with flex)
+            // Usually Kick's search is wrapped in a relative div, then a flex container
+            if (parent && parent.parentElement) {
+                target = parent.parentElement;
+                insertPosition = 'after';
+            }
+        }
+    }
+
+    if (!target) return; // Retry later if not found
+
+    // console.log('[Streamer Mode] Injecting UI next to search bar...');
+
+    const container = document.createElement('div');
+    container.id = 'kvd-streamer-container';
+    
+    // Style logic based on location
+    if (window.location.hostname === 'dashboard.kick.com') {
+         // Absolute centering for Dashboard
+         container.style.cssText = 'display: none; position: absolute; left: 50%; transform: translateX(-50%); align-items: center; gap: 8px; z-index: 50;';
+    } else {
+         // Flex flow for Channel Page
+         container.style.cssText = 'display: none; align-items: center; margin-left: 15px; margin-right: 15px; gap: 8px; z-index: 50;';
+    }
+    
+    // Toggle Switch
+    const toggle = document.createElement('div');
+    toggle.id = 'kvd-streamer-toggle';
+    toggle.title = 'Auto-download latest VOD when stream ends (Reloads page)';
+    toggle.style.cssText = 'width: 44px; height: 24px; background: #1a1a1a; border-radius: 12px; position: relative; cursor: pointer; border: 2px solid #555; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+    
+    const knob = document.createElement('div');
+    knob.id = 'kvd-streamer-knob';
+    knob.style.cssText = 'width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: all 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);';
+    
+    toggle.appendChild(knob);
+    
+    // Label
+    const label = document.createElement('span');
+    label.textContent = 'Auto-DL';
+    label.style.cssText = 'font-size: 13px; font-weight: 700; color: #ccc; user-select: none;';
+    
+    container.appendChild(toggle);
+    container.appendChild(label);
+    
+    // Insert based on position strategy
+    if (insertPosition === 'before') {
+        target.parentNode.insertBefore(container, target);
+    } else if (insertPosition === 'after') {
+        if (target.nextSibling) {
+            target.parentNode.insertBefore(container, target.nextSibling);
+        } else {
+            target.parentNode.appendChild(container);
+        }
+    } else { // append
+        target.appendChild(container);
+    }
+    
+    // Event
+    const enableAutoDL = () => {
+        isStreamerModeEnabled = true;
+        preventTabInactivity(); // Prevent tab sleep
+        
+        // Enable Host Protection (Standard)
+        window.addEventListener('beforeunload', handleStreamerModeExit);
+        
+        // Enable Host Protection (SPA - History API Patch)
+        document.body.setAttribute('data-kvd-auto-dl', 'true');
+        
+        toggle.style.background = 'rgba(83, 252, 24, 0.2)';
+        toggle.style.borderColor = '#53fc18';
+        toggle.style.boxShadow = '0 0 10px rgba(83, 252, 24, 0.4)';
+        toggle.classList.add('kvd-pulse-active');
+        
+        knob.style.transform = 'translateX(20px)';
+        knob.style.background = '#53fc18';
+        label.style.color = '#53fc18';
+        
+        streamEndDetected = false;
+    };
+
+    const disableAutoDL = () => {
+        isStreamerModeEnabled = false;
+        allowTabInactivity();
+        
+        // Disable Host Protection
+        window.removeEventListener('beforeunload', handleStreamerModeExit);
+        document.body.removeAttribute('data-kvd-auto-dl');
+        
+        toggle.style.background = '#1a1a1a';
+        toggle.style.borderColor = '#555';
+        toggle.style.boxShadow = 'none';
+        toggle.classList.remove('kvd-pulse-active');
+        
+        knob.style.transform = 'translateX(0)';
+        knob.style.background = '#fff';
+        label.style.color = '#ccc';
+        
+        streamEndDetected = false;
+    };
+
+    toggle.onclick = () => {
+        if (!isStreamerModeEnabled) {
+            // Check if we are on Dashboard
+            if (window.location.hostname === 'dashboard.kick.com') {
+                const slug = getChannelSlug();
+                if (slug) {
+                    if (confirm('⚠️ ACTIVATE & REDIRECT?\n\nEnable Auto-DL and go to channel page?\nActivar Auto-DL e ir al canal?')) {
+                        localStorage.setItem('kvd_auto_dl_carry_over', 'true');
+                        window.location.href = `https://kick.com/${slug}`;
+                    }
+                } else {
+                    alert('Error: Could not determine channel slug.');
+                }
+                return;
+            }
+
+            // Normal Channel Page Activation
+            if (confirm('⚠️ ENABLE AUTO-DOWNLOAD?\n\n• When "Offline" is detected, the page will RELOAD IMMEDIATELY.\n• The system will wait 2 MINUTES for VOD generation.\n• Then it will automatically download the latest VOD.\n• Host/Redirect Protection will be ACTIVE.\n\n¿ACTIVAR AUTO-DESCARGA?\n• Al detectar "Offline", la página se RECARGARÁ INMEDIATAMENTE.\n• El sistema esperará 2 MINUTOS para la generación del VOD.\n• Luego descargará automáticamente el último VOD.\n• Protección contra Host/Redirección estará ACTIVA.')) {
+                enableAutoDL();
+            }
+        } else {
+            disableAutoDL();
+        }
+    };
+
+    // Check for Carry-Over State (Redirected from Dashboard)
+    if (localStorage.getItem('kvd_auto_dl_carry_over') === 'true') {
+        localStorage.removeItem('kvd_auto_dl_carry_over');
+        // Activate immediately without confirm
+        enableAutoDL();
+        console.log('[Streamer Mode] Auto-DL enabled via Dashboard redirect.');
+    }
+}
+
+function isOfflineVisible() {
+    const offlineBadge = document.querySelector('.bg-surfaceInverse-base');
+    if (offlineBadge && (offlineBadge.textContent.includes('Desconectado') || offlineBadge.textContent.includes('Offline'))) {
+        return true;
+    }
+    const h2s = document.querySelectorAll('h2');
+    for (const h of h2s) {
+        if (h.textContent.includes('está fuera de línea') || h.textContent.includes('is offline')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function checkStreamStatus() {
+    if (!isStreamerModeEnabled || streamEndDetected) return;
+
+    if (isOfflineVisible()) {
+        streamEndDetected = true;
+        console.log('[Streamer Mode] Stream went offline. Triggering Reload & Auto-DL...');
+        
+        // Hide UI immediately
+        const container = document.getElementById('kvd-streamer-container');
+        if (container) container.style.display = 'none';
+        
+        // Set Persistence Flags
+        localStorage.setItem('kvd_auto_dl_pending', 'true');
+        const slug = getChannelSlug();
+        if (slug) localStorage.setItem('kvd_channel_slug', slug);
+
+        // Reload Page
+        window.location.reload();
+    }
+}
+
 // Function to create the download button
+
 function createDownloadButton() {
     if (document.querySelector('.kick-vod-download-btn')) return;
 
@@ -1569,6 +2346,64 @@ function createDownloadButton() {
     });
 
     return btn;
+}
+
+// Function to inject download buttons into VOD thumbnails
+function injectThumbnailButtons() {
+    // Find all anchor tags that might be VODs
+    // Exclude existing buttons to avoid double injection
+    const links = document.querySelectorAll('a[href*="/video/"]:not(.kvd-processed), a[href*="/videos/"]:not(.kvd-processed)');
+    
+    links.forEach(link => {
+        const href = link.getAttribute('href');
+        // Extract ID
+        // Regex for UUID
+        const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+        const match = href.match(uuidRegex);
+        
+        if (match) {
+            const videoId = match[0];
+            
+            // Check if it's really a thumbnail (contains an image or video preview)
+            // This prevents adding buttons to text links
+            // Also check if we already injected a button manually (double check)
+            if ((link.querySelector('img') || link.querySelector('video') || link.querySelector('.bg-gray-900')) && !link.querySelector('.kvd-thumb-btn')) {
+                
+                link.classList.add('kvd-processed');
+                // Ensure relative positioning for absolute child
+                if (getComputedStyle(link).position === 'static') {
+                     link.style.position = 'relative';
+                }
+                
+                const btn = document.createElement('button');
+                btn.className = 'kvd-thumb-btn';
+                // Inner HTML structure with separate text span for hover effect
+                btn.innerHTML = '<span>⬇</span><span class="kvd-btn-text">Download</span>'; 
+                btn.title = 'Download VOD';
+                
+                // Navigate to video page and trigger download
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    
+                    if (isDownloading) {
+                        alert('Download in progress / Descarga en curso');
+                        return;
+                    }
+
+                    // Use sessionStorage to pass the auto-download flag
+                    // This is cleaner than URL parameters and survives the navigation
+                    sessionStorage.setItem('kvd_auto_download', 'true');
+                    sessionStorage.setItem('kvd_auto_download_id', videoId);
+                    
+                    // Navigate to the video
+                    window.location.href = href;
+                });
+                
+                link.appendChild(btn);
+            }
+        }
+    });
 }
 
 // Function to inject the button into the DOM
@@ -1635,28 +2470,465 @@ function injectButton() {
     }
 }
 
+// Check if we need to auto-trigger download from thumbnail click
+function checkAutoDownloadTrigger() {
+    const autoDl = sessionStorage.getItem('kvd_auto_download');
+    if (!autoDl) return;
+
+    const targetId = sessionStorage.getItem('kvd_auto_download_id');
+    const currentId = getVideoId();
+
+    if (currentId && targetId === currentId) {
+        const btn = document.querySelector('.kick-vod-download-btn');
+        if (btn && !btn.disabled) {
+            console.log('Kick VOD Downloader: Auto-triggering download for ID:', currentId);
+            // Clear flags immediately
+            sessionStorage.removeItem('kvd_auto_download');
+            sessionStorage.removeItem('kvd_auto_download_id');
+            
+            btn.click();
+        }
+    }
+}
+
+let globalCheckCycle = 0;
+
 // Persistencia: Comprobar cada segundo si el botón sigue ahí
 // Esto es necesario porque Kick es una SPA agresiva que regenera el DOM
 setInterval(() => {
+    globalCheckCycle++;
+    if (globalCheckCycle > 100) globalCheckCycle = 1; // Reset counter
+
     const currentId = getVideoId();
 
-    // Navigation detection
+    // Inject button first if needed (Every 3 seconds)
+    if ((globalCheckCycle % 3 === 0) && currentId && !document.querySelector('.kick-vod-download-btn')) {
+        injectButton();
+    }
+
+    // Check for auto-download trigger from thumbnail (Every 1s - Critical)
+    checkAutoDownloadTrigger();
+
+    // Navigation detection (Every 1s - Critical)
     if (currentDownloadVideoId && currentId && currentId !== currentDownloadVideoId) {
         console.log('Navigation detected! Cancelling download...');
         cancelRequested = true;
         handleUnload();
     }
 
-    if (currentId && !document.querySelector('.kick-vod-download-btn')) {
-        injectButton();
+    // --- Streamer Mode (Auto-DL) Management ---
+    // UI Injection (Every 2 seconds)
+    if (globalCheckCycle % 2 === 0) {
+        injectStreamerModeUI();
     }
+    
+    const streamerContainer = document.getElementById('kvd-streamer-container');
+    if (streamerContainer) {
+        // Visibility Logic: Only visible if Moderator AND Stream is Online (Not Offline)
+        // Lógica de Visibilidad: Solo visible si es Moderador Y el stream está en vivo (No Offline)
+        // Optimization: Cache offline check if possible, or accept 1s check as necessary cost
+        const isOffline = isOfflineVisible();
+        
+        if (isModerator() && !isOffline) {
+            if (streamerContainer.style.display === 'none') {
+                streamerContainer.style.display = 'flex';
+            }
+        } else {
+            if (streamerContainer.style.display !== 'none') {
+                streamerContainer.style.display = 'none';
+                
+                // Disable if user loses mod status (safety)
+                if (isStreamerModeEnabled && !streamEndDetected) {
+                    isStreamerModeEnabled = false;
+                    allowTabInactivity();
+                    const toggle = document.getElementById('kvd-streamer-toggle');
+                    if (toggle) {
+                        toggle.classList.remove('kvd-pulse-active');
+                        toggle.style.background = '#1a1a1a';
+                        toggle.style.borderColor = '#555';
+                        toggle.style.boxShadow = 'none';
+                        const knob = document.getElementById('kvd-streamer-knob');
+                        const label = streamerContainer.querySelector('span');
+                        if (knob) { 
+                            knob.style.transform = 'translateX(0)'; 
+                            knob.style.background = '#fff'; 
+                        }
+                        if (label) { label.style.color = '#ccc'; }
+                    }
+                }
+            }
+        }
+    }
+    
+    checkStreamStatus();
+    // -------------------------------------------
+    
+    // Inject thumbnail buttons periodically (Every 5 seconds - Low Priority)
+    if (globalCheckCycle % 5 === 0) {
+        injectThumbnailButtons();
+    }
+
+    // Inject Easter Eggs listener (Every 5 seconds - Low Priority)
+    if (globalCheckCycle % 5 === 0) {
+        injectEasterEggs();
+    }
+
 }, 1000);
 
-// Observer (backup)
+// Observer (backup) - Throttled to prevent performance issues
+let observerTimeout;
 const observer = new MutationObserver(() => {
-    if (getVideoId() && !document.querySelector('.kick-vod-download-btn')) {
-        injectButton(); // Llamada directa sin espera
-    }
+    if (observerTimeout) return;
+    
+    observerTimeout = setTimeout(() => {
+        if (getVideoId() && !document.querySelector('.kick-vod-download-btn')) {
+            injectButton(); 
+        }
+        // Also check for thumbnails
+        injectThumbnailButtons();
+        // Easter eggs
+        injectEasterEggs();
+        observerTimeout = null;
+    }, 1500); // Check at most every 1.5 seconds
 });
 
 observer.observe(document.body, { childList: true, subtree: true });
+
+// --- Helper: Robust Chat Sending ---
+function sendChatMessage(message) {
+    const chatInput = document.querySelector('div[data-testid="chat-input"][contenteditable="true"], div[data-input="true"][contenteditable="true"].editor-input');
+    if (!chatInput) return;
+
+    chatInput.focus();
+    
+    // 1. Clear existing content safely
+    // Selecting all allows insertText to replace, which is cleaner than innerHTML = ''
+    document.execCommand('selectAll', false, null);
+    
+    // 2. Try execCommand 'insertText' (Native browser behavior)
+    // This automatically triggers 'input', 'change', etc., and updates the undo stack.
+    // Most modern editors (ProseMirror, Slate, Lexical) handle this correctly.
+    const success = document.execCommand('insertText', false, message);
+    
+    if (!success) {
+        // 3. Fallback: Manual DOM construction
+        console.log('KVD: execCommand failed, using DOM fallback');
+        chatInput.innerHTML = ''; // Force clear
+        const p = document.createElement('p');
+        p.className = 'editor-paragraph';
+        const span = document.createElement('span');
+        span.textContent = message; // textContent handles escaping automatically
+        p.appendChild(span);
+        chatInput.appendChild(p);
+        
+        // Dispatch input event to wake up the framework
+        chatInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    }
+
+    // 4. Trigger Send (Enter Key or Button)
+    setTimeout(() => {
+        const sendBtn = document.querySelector('button[aria-label="Send message"], button[aria-label="Enviar mensaje"], button.chat-input-send-button');
+        
+        if (sendBtn && !sendBtn.disabled) {
+            sendBtn.click();
+        } else {
+            // Fallback to Enter key event
+            const enterEvent = new KeyboardEvent('keydown', {
+                key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                bubbles: true, cancelable: true, view: window
+            });
+            chatInput.dispatchEvent(enterEvent);
+        }
+    }, 50); // Short delay to allow React to process the input update
+}
+
+// --- Easter Eggs (Roadmap #28 & #29) & Custom Commands ---
+function injectEasterEggs() {
+    // Selector based on Roadmap line 30 & 41
+    const chatInput = document.querySelector('div[data-testid="chat-input"][contenteditable="true"], div[data-input="true"][contenteditable="true"].editor-input');
+    
+    if (chatInput && !chatInput.dataset.kvdEggAttached) {
+        chatInput.dataset.kvdEggAttached = "true";
+        
+        chatInput.addEventListener('input', (e) => {
+            // STOP INFINITE LOOPS: Ignore events generated by our own code
+            if (!e.isTrusted) return;
+
+            // Robust text extraction
+            const rawText = e.target.innerText || e.target.textContent || "";
+            // Normalize: remove zero-width spaces, turn all whitespace to single space, lowercase
+            const cleanText = rawText.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+            
+            // Helper to clear chat input visually immediately
+            const clearChat = () => {
+                e.target.textContent = '';
+                e.target.innerHTML = '<p class="editor-paragraph"><br></p>';
+                // Dispatch input to sync empty state
+                e.target.dispatchEvent(new Event('input', { bubbles: true }));
+            };
+
+            // --- Custom Commands ---
+            if (cleanText === '!redes') {
+                clearChat();
+                // Default social message - User can customize this later via settings (Todo)
+                // Mensaje por defecto
+                sendChatMessage("Mis redes: Twitter: @KickStreaming | IG: @KickStreaming (Ejemplo - Configurar en extensión)");
+                return;
+            }
+
+            // --- Easter Eggs ---
+
+            // Roadmap #28: "Imaginate un cubo"
+            if (cleanText.includes('imaginate un cubo')) {
+                clearChat();
+                triggerCubeEasterEgg();
+                return; 
+            }
+
+            // "Contexto: No te imaginaste un cubo"
+            if (cleanText.includes('contexto: no te imaginaste un cubo')) {
+                clearChat();
+                triggerCubeContextEasterEgg();
+                return;
+            }
+
+            // "Aguante Pavle"
+            if (cleanText.includes('aguante pavle')) {
+                clearChat();
+                triggerPavleEasterEgg();
+                return;
+            }
+
+            // "Mondongo"
+            if (cleanText.includes('mondongo')) {
+                clearChat();
+                triggerMondongoEasterEgg();
+                return;
+            }
+
+            // "Mambo"
+            if (cleanText.includes('mambo')) {
+                clearChat();
+                triggerMamboEasterEgg();
+                return;
+            }
+
+            // "Una maroma!" (Barrel Roll)
+            if (cleanText.includes('una maroma!')) {
+                clearChat();
+                document.body.classList.add('kvd-barrel-roll');
+                setTimeout(() => document.body.classList.remove('kvd-barrel-roll'), 1000);
+                return;
+            }
+
+            // "me derrito lpm" (Melt)
+            if (cleanText.includes('me derrito lpm')) {
+                clearChat();
+                document.body.classList.add('kvd-melt-effect');
+                // Wait for animation (4s) + a brief "empty" moment (1s)
+                setTimeout(() => document.body.classList.remove('kvd-melt-effect'), 5000);
+                return;
+            }
+
+            // Roadmap #29: "Si le doy un cabezazo al teclado soy admin"
+            const enableAdminTricks = [
+                "si le doy un cabezazo al teclado soy admin",
+                "si le doy un cabezazo al teclado soy admin."
+            ];
+            
+            // Enable Admin Mode (Per Channel)
+            if (enableAdminTricks.some(trick => cleanText.includes(trick))) {
+                const slug = getChannelSlug();
+                if (!slug) return;
+
+                const adminChannels = JSON.parse(localStorage.getItem('kvd_admin_channels') || '[]');
+                
+                if (adminChannels.includes(slug)) {
+                     clearChat(); // Already enabled
+                     return;
+                }
+
+                adminChannels.push(slug);
+                localStorage.setItem('kvd_admin_channels', JSON.stringify(adminChannels));
+                
+                // Cleanup old global flag to avoid confusion
+                localStorage.removeItem('kvd_admin_trick_enabled');
+
+                clearChat();
+                
+                setTimeout(() => {
+                    alert(`🔓 Admin Mode Unlocked for ${slug}! / ¡Modo Admin Desbloqueado para ${slug}!`);
+                    window.location.reload();
+                }, 100);
+                return;
+            }
+
+            // Disable Admin Mode (Global) - "Ser admin me da ansiedad"
+            const disableAdminTricks = [
+                "ser admin me da ansiedad",
+                "ser admin me da ansiedad."
+            ];
+
+            if (disableAdminTricks.some(trick => cleanText.includes(trick))) {
+                localStorage.removeItem('kvd_admin_channels');
+                localStorage.removeItem('kvd_admin_trick_enabled'); // Ensure global is gone too
+                
+                clearChat();
+
+                setTimeout(() => {
+                    alert('🔒 Admin Mode Disabled for ALL channels. / Modo Admin Desactivado para TODOS los canales.');
+                    window.location.reload();
+                }, 100);
+                return;
+            }
+        });
+    }
+}
+
+function triggerCubeEasterEgg() {
+    // Check if container already exists, remove it to restart cleanly
+    let existingContainer = document.getElementById('kvd-cube-container');
+    if (existingContainer) {
+        existingContainer.remove();
+    }
+    
+    const container = document.createElement('div');
+    container.id = 'kvd-cube-container';
+    container.className = 'kvd-cube-container active';
+    
+    container.innerHTML = `
+        <div class="kvd-cube">
+            <div class="kvd-cube-face front">Kick</div>
+            <div class="kvd-cube-face back">VOD</div>
+            <div class="kvd-cube-face right">Mondongo</div>
+            <div class="kvd-cube-face left">Pavle</div>
+            <div class="kvd-cube-face top small-text">Extensión hecha por TheNestorHD</div>
+            <div class="kvd-cube-face bottom">Mira mi huevo</div>
+        </div>
+    `;
+    
+    document.body.appendChild(container);
+    
+    // Remove after 10 seconds (animation duration matches CSS)
+    setTimeout(() => {
+        if (container && container.parentNode) {
+            container.parentNode.removeChild(container);
+        }
+    }, 10000);
+}
+
+function triggerCubeContextEasterEgg() {
+    // Check if container already exists, remove it
+    let existingContainer = document.getElementById('kvd-cube-container');
+    if (existingContainer) existingContainer.remove();
+    let existingText = document.getElementById('kvd-context-text');
+    if (existingText) existingText.remove();
+
+    // Create Cube Container with context-mode class
+    const container = document.createElement('div');
+    container.id = 'kvd-cube-container';
+    container.className = 'kvd-cube-container context-mode';
+    
+    container.innerHTML = `
+        <div class="kvd-cube">
+            <div class="kvd-cube-face front">Kick</div>
+            <div class="kvd-cube-face back">VOD</div>
+            <div class="kvd-cube-face right">Mondongo</div>
+            <div class="kvd-cube-face left">Pavle</div>
+            <div class="kvd-cube-face top small-text">Extensión hecha por TheNestorHD</div>
+            <div class="kvd-cube-face bottom">Mira mi huevo</div>
+        </div>
+    `;
+
+    // Create Text Element
+    const textEl = document.createElement('div');
+    textEl.id = 'kvd-context-text';
+    textEl.className = 'kvd-context-text';
+    textEl.textContent = 'No te imaginaste un cubo';
+
+    document.body.appendChild(container);
+    document.body.appendChild(textEl);
+
+    // Remove after 5 seconds
+    setTimeout(() => {
+        if (container.parentNode) container.parentNode.removeChild(container);
+        if (textEl.parentNode) textEl.parentNode.removeChild(textEl);
+    }, 5000);
+}
+
+function triggerPavleEasterEgg() {
+    // Create image element
+    const pavleImg = document.createElement('img');
+    pavleImg.src = chrome.runtime.getURL('assets/pavle.png');
+    pavleImg.alt = 'Pavle Toasty';
+    pavleImg.className = 'kvd-pavle-toasty';
+    
+    // Create audio element
+    const toastyAudio = document.createElement('audio');
+    toastyAudio.src = chrome.runtime.getURL('assets/toasty.ogg');
+    toastyAudio.volume = 0.7;
+    
+    // Add to DOM
+    document.body.appendChild(pavleImg);
+    document.body.appendChild(toastyAudio);
+    
+    // Play sound
+    toastyAudio.play().catch(e => console.error('Error playing toasty sound:', e));
+    
+    // Animate for 1s
+    setTimeout(() => {
+        // Remove elements
+        if (pavleImg.parentNode) pavleImg.parentNode.removeChild(pavleImg);
+        if (toastyAudio.parentNode) toastyAudio.parentNode.removeChild(toastyAudio);
+    }, 1000);
+}
+
+function triggerMondongoEasterEgg() {
+    // Create image element
+    const gokuImg = document.createElement('img');
+    gokuImg.src = chrome.runtime.getURL('assets/gokupelado.png');
+    gokuImg.alt = 'Mondongo';
+    gokuImg.className = 'kvd-goku-mondongo';
+    
+    // Create audio element
+    const mondongoAudio = document.createElement('audio');
+    mondongoAudio.src = chrome.runtime.getURL('assets/mondongo.ogg');
+    
+    // Add to DOM
+    document.body.appendChild(gokuImg);
+    document.body.appendChild(mondongoAudio);
+    
+    // Play sound
+    mondongoAudio.play().catch(e => console.error('Error playing mondongo sound:', e));
+    
+    // Remove after 1s
+    setTimeout(() => {
+        if (gokuImg.parentNode) gokuImg.parentNode.removeChild(gokuImg);
+        if (mondongoAudio.parentNode) mondongoAudio.parentNode.removeChild(mondongoAudio);
+    }, 1000);
+}
+
+function triggerMamboEasterEgg() {
+    // Create image element
+    const mamboImg = document.createElement('img');
+    mamboImg.src = chrome.runtime.getURL('assets/mambo.png');
+    mamboImg.alt = 'Mambo';
+    mamboImg.className = 'kvd-mambo-img';
+    
+    // Create audio element
+    const mamboAudio = document.createElement('audio');
+    mamboAudio.src = chrome.runtime.getURL('assets/mambo.ogg');
+    
+    // Add to DOM
+    document.body.appendChild(mamboImg);
+    document.body.appendChild(mamboAudio);
+    
+    // Play sound
+    mamboAudio.play().catch(e => console.error('Error playing mambo sound:', e));
+    
+    // Remove after 1s
+    setTimeout(() => {
+        if (mamboImg.parentNode) mamboImg.parentNode.removeChild(mamboImg);
+        if (mamboAudio.parentNode) mamboAudio.parentNode.removeChild(mamboAudio);
+    }, 1000);
+}
