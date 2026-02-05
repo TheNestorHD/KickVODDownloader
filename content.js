@@ -1354,9 +1354,15 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         let nextFetchIndex = 0;
         let nextProcessIndex = 0;
         const pendingSegments = new Map();
+        let processError = null;
+        let pendingTransmuxSegments = 0;
 
         const maxRetries = 20;
-        const downloadConcurrency = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
+        const networkHint = (navigator.connection && navigator.connection.downlink) ? navigator.connection.downlink : 0;
+        const adaptiveBase = networkHint >= 200 ? 20 : networkHint >= 100 ? 14 : networkHint >= 50 ? 10 : 8;
+        const userCap = Number(localStorage.getItem('kvd_max_segment_connections') || adaptiveBase);
+        const downloadConcurrency = Math.max(4, Math.min(24, Number.isFinite(userCap) ? userCap : adaptiveBase));
+        const transmuxFlushEvery = 4;
         console.log(`[Download] Using ${downloadConcurrency} concurrent segment connections.`);
 
         async function fetchSegmentWithRetry(index) {
@@ -1417,7 +1423,14 @@ Waiting ${Math.round(delay / 1000)}s`,
                         cleanBytes.set(sourceBytes);
 
                         transmuxer.push(cleanBytes);
-                        transmuxer.flush();
+                        pendingTransmuxSegments++;
+
+                        const processedCount = nextProcessIndex + 1;
+                        const isLastSegment = processedCount >= segments.length;
+                        if (pendingTransmuxSegments >= transmuxFlushEvery || isLastSegment) {
+                            transmuxer.flush();
+                            pendingTransmuxSegments = 0;
+                        }
                         consecutiveFailures = 0;
                     } else {
                         consecutiveFailures++;
@@ -1465,19 +1478,28 @@ Waiting ${Math.round(delay / 1000)}s`,
 
         const worker = async () => {
             while (true) {
+                if (processError) break;
                 const index = nextFetchIndex;
                 nextFetchIndex++;
                 if (index >= segments.length) break;
 
                 const segData = await fetchSegmentWithRetry(index);
                 pendingSegments.set(index, segData);
-                await processPendingSegments();
+                processPendingSegments().catch((e) => {
+                    processError = e;
+                });
             }
         };
 
         const workers = Array.from({ length: downloadConcurrency }, () => worker());
         await Promise.all(workers);
         await processPendingSegments();
+        if (processError) throw processError;
+
+        if (pendingTransmuxSegments > 0) {
+            transmuxer.flush();
+            pendingTransmuxSegments = 0;
+        }
 
         if (nextProcessIndex < segments.length) {
             throw new Error('Some segments were not processed correctly.');
