@@ -1351,71 +1351,101 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         };
 
         let consecutiveFailures = 0;
+        let nextFetchIndex = 0;
+        let nextProcessIndex = 0;
+        const pendingSegments = new Map();
 
-        for (let i = 0; i < segments.length; i++) {
-            if (cancelRequested) {
-                throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
-            }
+        const maxRetries = 20;
+        const downloadConcurrency = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4)));
+        console.log(`[Download] Using ${downloadConcurrency} concurrent segment connections.`);
 
+        async function fetchSegmentWithRetry(index) {
             let attempt = 0;
-            const maxRetries = 20; // Increased retries for robustness
-            let success = false;
-
-            while (attempt < maxRetries && !success) {
+            while (attempt < maxRetries) {
                 try {
                     if (cancelRequested) throw new Error('Download cancelled');
 
-                    const segRes = await fetch(segments[i]);
+                    const segRes = await fetch(segments[index]);
                     if (!segRes.ok) {
-                        // If 404, it might be permanent, but sometimes CDNs are weird. We retry.
-                        throw new Error(`Failed to fetch segment ${i}, status: ${segRes.status}`);
+                        throw new Error(`Failed to fetch segment ${index}, status: ${segRes.status}`);
                     }
-                    const segData = await segRes.arrayBuffer();
-                    
-                    // Track total bytes
-                    totalBytes += segData.byteLength;
-                    
-                    // Push to transmuxer
-                    // Fix for Firefox "Permission denied to access property constructor"
-                    // Clone data into a new Uint8Array created explicitly in this scope
-                    const sourceBytes = new Uint8Array(segData);
-                    const cleanBytes = new Uint8Array(sourceBytes.length);
-                    cleanBytes.set(sourceBytes);
+                    return await segRes.arrayBuffer();
+                } catch (err) {
+                    if ((err.message || '').includes('Download cancelled')) throw err;
 
-                    transmuxer.push(cleanBytes);
-                    transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
+                    attempt++;
+                    console.error(`Error fetching segment ${index} (Attempt ${attempt}/${maxRetries}):`, err);
 
-                    success = true;
-                    consecutiveFailures = 0;
+                    if (attempt >= maxRetries) {
+                        console.error(`Max retries reached for segment ${index}. Skipping... (Video might be glitchy)`);
+                        return null;
+                    }
 
-                    // Update progress
-                    const progress = Math.round(((i + 1) / segments.length) * 100);
-                    
-                    // Calculate instantaneous speed and ETA every ~1s or when progress changes
+                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
+                    const jitter = Math.random() * 500;
+                    const delay = backoff + jitter;
+
+                    updateOverlay(lastProgress,
+                        `Connection Issue / Problema de Conexión`,
+                        `Retrying segment ${index}/${segments.length} (Attempt ${attempt}/${maxRetries})...
+Waiting ${Math.round(delay / 1000)}s`,
+                        totalBytes,
+                        0
+                    );
+
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            return null;
+        }
+
+        let processChain = Promise.resolve();
+        const processPendingSegments = () => {
+            processChain = processChain.then(async () => {
+                while (pendingSegments.has(nextProcessIndex)) {
+                    if (cancelRequested) {
+                        throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
+                    }
+
+                    const segData = pendingSegments.get(nextProcessIndex);
+                    pendingSegments.delete(nextProcessIndex);
+
+                    if (segData) {
+                        totalBytes += segData.byteLength;
+                        const sourceBytes = new Uint8Array(segData);
+                        const cleanBytes = new Uint8Array(sourceBytes.length);
+                        cleanBytes.set(sourceBytes);
+
+                        transmuxer.push(cleanBytes);
+                        transmuxer.flush();
+                        consecutiveFailures = 0;
+                    } else {
+                        consecutiveFailures++;
+                    }
+
+                    const processedCount = nextProcessIndex + 1;
+                    const progress = Math.round((processedCount / segments.length) * 100);
                     const now = Date.now();
-                    const timeDiff = (now - lastSpeedTime) / 1000; // seconds
-                    
-                    // Calculate speed every second regardless of progress change
-                    if (timeDiff >= 1) { 
-                         const bytesDiff = totalBytes - lastSpeedBytes;
-                         currentSpeed = bytesDiff / timeDiff; // bytes per second
-                         lastSpeedTime = now;
-                         lastSpeedBytes = totalBytes;
+                    const timeDiff = (now - lastSpeedTime) / 1000;
+
+                    if (timeDiff >= 1) {
+                        const bytesDiff = totalBytes - lastSpeedBytes;
+                        currentSpeed = bytesDiff / timeDiff;
+                        lastSpeedTime = now;
+                        lastSpeedBytes = totalBytes;
                     }
 
-                    // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
                     if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
-                        lastProgress = Math.max(lastProgress, progress); // Keep max progress
+                        lastProgress = Math.max(lastProgress, progress);
                         lastUiUpdate = now;
-                        
-                        // Calculate ETA
-                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+
+                        const elapsedTime = (Date.now() - startTime) / 1000;
                         let etaText = 'Calculating time...';
-                        
-                        if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
-                            const rate = (i + 1) / elapsedTime; // segments per second
-                            const remainingSegments = segments.length - (i + 1);
-                            const etaSeconds = remainingSegments / rate;
+
+                        if (elapsedTime > 2 && processedCount > 0) {
+                            const rate = processedCount / elapsedTime;
+                            const remainingSegments = segments.length - processedCount;
+                            const etaSeconds = remainingSegments / Math.max(rate, 0.01);
                             etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
                         }
 
@@ -1423,40 +1453,34 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                         updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
                     }
 
-                } catch (err) {
-                    if (err.message.includes('Download cancelled')) throw err;
-
-                    attempt++;
-                    consecutiveFailures++;
-                    console.error(`Error processing segment ${i} (Attempt ${attempt}/${maxRetries}):`, err);
-                    
-                    if (attempt >= maxRetries) {
-                        console.error(`Max retries reached for segment ${i}. Skipping... (Video might be glitchy)`);
-                        // We skip this segment instead of failing the whole download. 
-                        // The video will have a small jump/glitch but it's better than nothing.
-                        break; 
-                    }
-
                     if (consecutiveFailures >= 12) {
                         throw new Error('Too many consecutive download failures. Aborting to prevent looping.');
                     }
 
-                    // Wait before retry (Exponential Backoff: 1s, 2s, 4s, 8s... max 15s)
-                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
-                    const jitter = Math.random() * 500;
-                    const delay = backoff + jitter;
-                    
-                    // Show retry status in overlay
-                    updateOverlay(lastProgress, 
-                        `Connection Issue / Problema de Conexión`, 
-                        `Retrying segment ${i}/${segments.length} (Attempt ${attempt}/${maxRetries})...\nWaiting ${Math.round(delay/1000)}s`, 
-                        totalBytes, 
-                        0 // Speed 0 while waiting
-                    );
-
-                    await new Promise(resolve => setTimeout(resolve, delay));
+                    nextProcessIndex++;
                 }
+            });
+            return processChain;
+        };
+
+        const worker = async () => {
+            while (true) {
+                const index = nextFetchIndex;
+                nextFetchIndex++;
+                if (index >= segments.length) break;
+
+                const segData = await fetchSegmentWithRetry(index);
+                pendingSegments.set(index, segData);
+                await processPendingSegments();
             }
+        };
+
+        const workers = Array.from({ length: downloadConcurrency }, () => worker());
+        await Promise.all(workers);
+        await processPendingSegments();
+
+        if (nextProcessIndex < segments.length) {
+            throw new Error('Some segments were not processed correctly.');
         }
 
         // 100% reached, but still writing/closing
