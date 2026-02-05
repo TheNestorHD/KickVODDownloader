@@ -4,6 +4,8 @@
 
 ![Icon](icons/icon128.png)
 
+Download the extension for [Firefox](https://addons.mozilla.org/es-ES/firefox/addon/kick-vod-downloader/) and [Edge](https://microsoftedge.microsoft.com/addons/detail/kick-vod-downloader/doiaphmcfjpfdneockmlagecidagaehn)! (Not yet approved in other stores)
+
 ## 🇬🇧 English
 
 ### 🚀 Key Features
