@@ -1591,20 +1591,16 @@ Waiting ${Math.round(delay / 1000)}s`,
         sendNotification('Download Complete / Descarga Completa', `The VOD "${getVideoId() || 'video'}" has been downloaded successfully.`);
         updateButton(btn, 'Download Complete!', false);
         shouldResetState = true;
+        shouldClearChunks = true;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
         
-        // Restore audio after successful download (before reload)
+        // Restore audio after successful download
         restorePageAudio();
 
-        setTimeout(async () => {
+        setTimeout(() => {
              setButtonToDownload(btn);
-             // Force reload to clear memory/state and prevent bugs
-             try {
-                 await clearChunksFromDB(); 
-             } catch (e) { console.error(e); }
-             window.location.reload();
-        }, 4000);
+        }, 2500);
 
     } catch (error) {
         // Flag cleanup on error
@@ -1619,9 +1615,8 @@ Waiting ${Math.round(delay / 1000)}s`,
         // Only alert if it's not a user cancellation
         if (error.name === 'AbortError' || error.message.includes('user aborted') || error.message.includes('cancelled by user')) {
              updateButton(btn, 'Cancelled', false);
-             // Reload immediately as requested
-             console.log('Download cancelled. Reloading page to cleanup...');
-             window.location.reload();
+             console.log('Download cancelled. Cleaning up without reload...');
+             setTimeout(() => setButtonToDownload(btn), 1500);
         } else {
             sendNotification('Download Failed / Error de Descarga', `Error: ${error.message}`);
             alert('Download failed: ' + error.message);
@@ -1643,6 +1638,9 @@ Waiting ${Math.round(delay / 1000)}s`,
         if (shouldClearChunks || usedIdbFallback) {
             await cleanupDownloadArtifacts({ clearChunks: true, removeFile: false });
         }
+
+        // Defensive cleanup to avoid stale chunks from interrupted sessions
+        await clearChunksFromDB().catch(() => {});
 
         if (!deferObjectUrlCleanup && tempLink && tempLink.parentNode) {
             tempLink.parentNode.removeChild(tempLink);
