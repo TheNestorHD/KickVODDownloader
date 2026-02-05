@@ -4,6 +4,12 @@ EL AGENTE NO DEBE EDITAR ESTE ARCHIVO, SÓLO LEERLO. EL USUARIO LO EDITARÁ CUAN
 
 Este archivo rastrea las características planificadas, mejoras y problemas conocidos a abordar en futuras versiones de Kick VOD Downloader.
 
+## 🔐 Seguridad y Calidad (Sugerencias)
+- [x] **Validar origen de mensajes internos**: Verificar `sender.id` en `chrome.runtime.onMessage` y descartar mensajes no provenientes de la extensión para minimizar superficies de ataque entre extensiones.
+- [x] **Limitar longitud de mensajes de chat**: Evitar cargas excesivas o bloqueos de UI al enviar mensajes largos desde la biblioteca.
+- [ ] **Auditar URLs de streaming**: Añadir validación de esquema/host para evitar que playlists maliciosas inyecten URLs inesperadas (defensa en profundidad).
+- [ ] **Límites de concurrencia y backoff global**: Unificar reintentos y límites de descarga para minimizar abuso accidental y reducir carga en el navegador.
+
 ## 🔮 Próxima versión v2.1.0 (Cuando se termina de trabajar en la lista de funciones y arreglo de bugs se debe subir de versión en los manifest)
 
 ### 🐛 Correcciones y Mejoras

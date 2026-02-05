@@ -97,6 +97,32 @@ const DB_NAME = 'KickDownloaderDB';
 const HANDLE_STORE = 'handles';
 const CHUNK_STORE = 'chunks';
 
+function requestToPromise(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function withStore(storeName, mode, operation) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, mode);
+        const store = tx.objectStore(storeName);
+        let result;
+
+        try {
+            result = operation(store);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
 function openDB() {
     return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, 2); // Version 2
@@ -116,36 +142,24 @@ function openDB() {
 
 async function saveHandleToDB(handle) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).put(handle, 'interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.put(handle, 'interrupted_download');
         });
     } catch (e) { console.error('DB Save Handle Error', e); }
 }
 
 async function clearHandleFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).delete('interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.delete('interrupted_download');
         });
     } catch (e) { console.error('DB Clear Handle Error', e); }
 }
 
 async function saveChunkToDB(chunk) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).add(chunk);
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.add(chunk);
         });
     } catch (e) { 
         console.error('DB Save Chunk Error', e);
@@ -155,26 +169,16 @@ async function saveChunkToDB(chunk) {
 
 async function clearChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).clear();
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.clear();
         });
     } catch (e) { console.error('DB Clear Chunks Error', e); }
 }
 
 async function getAllChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readonly');
-        const store = tx.objectStore(CHUNK_STORE);
-        const request = store.getAll();
-        
-        return new Promise((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
+        return await withStore(CHUNK_STORE, 'readonly', (store) => {
+            return requestToPromise(store.getAll());
         });
     } catch (e) {
         console.error('DB Get All Chunks Error', e);
@@ -232,6 +236,10 @@ function showFirstKickVisitAlert() {
 checkAndCleanup();
 showFirstKickVisitAlert();
 
+const isValidRuntimeMessage = (sender, request) => {
+    return sender && sender.id === chrome.runtime.id && request && typeof request.type === 'string';
+};
+
 // Cleanup on page reload/close
 const handleUnload = () => {
     // Only delete file if we are in the middle of a download
@@ -252,6 +260,7 @@ window.addEventListener('pagehide', handleUnload);
 
 // Listen for messages from background script (Navigation detection) and Popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!isValidRuntimeMessage(sender, request)) return;
     // --- POPUP: Admin Check ---
     if (request.type === 'CHECK_ADMIN') {
         sendResponse({ isAdmin: isModerator() });
@@ -266,7 +275,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     // --- POPUP: Send Chat ---
     if (request.type === 'SEND_CHAT') {
-        sendChatMessage(request.message);
+        if (typeof request.message === 'string' && request.message.trim()) {
+            const safeMessage = request.message.slice(0, 500);
+            sendChatMessage(safeMessage);
+        }
         return true;
     }
 });
