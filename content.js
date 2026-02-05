@@ -97,6 +97,36 @@ const DB_NAME = 'KickDownloaderDB';
 const HANDLE_STORE = 'handles';
 const CHUNK_STORE = 'chunks';
 
+function requestToPromise(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function withStore(storeName, mode, operation) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, mode);
+        const store = tx.objectStore(storeName);
+        let result;
+
+        try {
+            result = operation(store);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+
+        const resultPromise = Promise.resolve(result);
+        tx.oncomplete = () => {
+            resultPromise.then(resolve).catch(reject);
+        };
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+    });
+}
+
 function openDB() {
     return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, 2); // Version 2
@@ -116,36 +146,24 @@ function openDB() {
 
 async function saveHandleToDB(handle) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).put(handle, 'interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.put(handle, 'interrupted_download');
         });
     } catch (e) { console.error('DB Save Handle Error', e); }
 }
 
 async function clearHandleFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).delete('interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.delete('interrupted_download');
         });
     } catch (e) { console.error('DB Clear Handle Error', e); }
 }
 
 async function saveChunkToDB(chunk) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).add(chunk);
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.add(chunk);
         });
     } catch (e) { 
         console.error('DB Save Chunk Error', e);
@@ -155,26 +173,16 @@ async function saveChunkToDB(chunk) {
 
 async function clearChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).clear();
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.clear();
         });
     } catch (e) { console.error('DB Clear Chunks Error', e); }
 }
 
 async function getAllChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readonly');
-        const store = tx.objectStore(CHUNK_STORE);
-        const request = store.getAll();
-        
-        return new Promise((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
+        return await withStore(CHUNK_STORE, 'readonly', (store) => {
+            return requestToPromise(store.getAll());
         });
     } catch (e) {
         console.error('DB Get All Chunks Error', e);
@@ -232,6 +240,10 @@ function showFirstKickVisitAlert() {
 checkAndCleanup();
 showFirstKickVisitAlert();
 
+const isValidRuntimeMessage = (sender, request) => {
+    return sender && sender.id === chrome.runtime.id && request && typeof request.type === 'string';
+};
+
 // Cleanup on page reload/close
 const handleUnload = () => {
     // Only delete file if we are in the middle of a download
@@ -252,6 +264,7 @@ window.addEventListener('pagehide', handleUnload);
 
 // Listen for messages from background script (Navigation detection) and Popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!isValidRuntimeMessage(sender, request)) return;
     // --- POPUP: Admin Check ---
     if (request.type === 'CHECK_ADMIN') {
         sendResponse({ isAdmin: isModerator() });
@@ -266,7 +279,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     // --- POPUP: Send Chat ---
     if (request.type === 'SEND_CHAT') {
-        sendChatMessage(request.message);
+        if (typeof request.message === 'string' && request.message.trim()) {
+            const safeMessage = request.message.slice(0, 500);
+            sendChatMessage(safeMessage);
+        }
         return true;
     }
 });
@@ -730,14 +746,97 @@ function sendNotification(title, message) {
     }
 }
 
+function isAllowedStreamUrl(url, baseHost) {
+    try {
+        const parsed = new URL(url, window.location.href);
+        if (!['https:', 'http:'].includes(parsed.protocol)) return false;
+        if (!baseHost) return true;
+        return parsed.hostname === baseHost || parsed.hostname.endsWith(`.${baseHost}`);
+    } catch (e) {
+        console.warn('Invalid stream URL detected:', url, e);
+        return false;
+    }
+}
+
+function resetDownloadState() {
+    isDownloading = false;
+    allowTabInactivity();
+    cancelRequested = false;
+    currentDownloadVideoId = null;
+    currentDownloadPath = null;
+    currentFileHandle = null;
+    currentWritable = null;
+}
+
+async function cleanupDownloadArtifacts({ clearChunks = false, removeFile = false } = {}) {
+    if (clearChunks) {
+        await clearChunksFromDB();
+    }
+    if (removeFile && currentFileHandle && currentFileHandle.remove) {
+        await currentFileHandle.remove().catch(e => console.error('Remove failed', e));
+    }
+}
+
+async function convertM4aToMp3(blob) {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('audio/mpeg')) {
+        throw new Error('MP3 encoding not supported in this browser');
+    }
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const destination = audioContext.createMediaStreamDestination();
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(destination);
+
+    const recorder = new MediaRecorder(destination.stream, { mimeType: 'audio/mpeg' });
+    const chunks = [];
+
+    const recordPromise = new Promise((resolve, reject) => {
+        recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                chunks.push(event.data);
+            }
+        };
+        recorder.onerror = (event) => reject(event.error || event);
+        recorder.onstop = () => resolve(new Blob(chunks, { type: 'audio/mpeg' }));
+    });
+
+    recorder.start();
+    source.start(0);
+
+    const durationMs = Math.max(0, audioBuffer.duration * 1000);
+    await new Promise(resolve => setTimeout(resolve, durationMs + 250));
+    recorder.stop();
+    source.stop();
+    audioContext.close().catch(() => {});
+
+    return recordPromise;
+}
+
 async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null, forceMemory = false, explicitVideoId = null) {
+    let isAudioOnly = false;
+    let audioOnlyFormat = null;
+    let usedIdbFallback = false;
+    let shouldClearChunks = false;
+    let shouldRemoveFile = false;
+    let objectUrl = null;
+    let tempLink = null;
+    let shouldResetState = false;
+    let deferObjectUrlCleanup = false;
+
     try {
         // Check for Audio Only mode (passed via URL hash)
-        let isAudioOnly = false;
-        if (streamUrl.endsWith('#audio_only')) {
+        if (streamUrl.includes('#audio_only')) {
             isAudioOnly = true;
-            streamUrl = streamUrl.replace('#audio_only', '');
-            console.log('Audio Only Mode Detected (M4A/AAC)');
+            const match = streamUrl.match(/#audio_only(?:=(mp3|m4a))?/i);
+            audioOnlyFormat = match && match[1] ? match[1].toLowerCase() : 'm4a';
+            streamUrl = streamUrl.replace(/#audio_only(?:=[^#]*)?/i, '');
+            console.log(`Audio Only Mode Detected (${audioOnlyFormat?.toUpperCase() || 'M4A/AAC'})`);
+        }
+
+        if (audioOnlyFormat === 'mp3') {
+            forceMemory = true;
         }
 
         isDownloading = true;
@@ -750,9 +849,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             originalPageTitle = document.title;
         }
 
+
         // --- FILE PICKER MOVED HERE TO SATISFY USER GESTURE REQUIREMENT ---
         // We must ask for the file handle immediately, before any network requests (fetch)
         let handle = preOpenedHandle;
+
+        if (forceMemory) {
+            handle = null;
+        }
         
         // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle AND not forced memory mode
         if (!forceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
@@ -803,6 +907,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 console.log(`Using DOM Video Duration as fallback: ${videoDurationMs}ms`);
             }
         }
+
+        const baseStreamHost = (() => {
+            try {
+                return new URL(streamUrl).hostname;
+            } catch {
+                return null;
+            }
+        })();
 
         // 1. Fetch playlist with Cache Buster to avoid stale CDNs
         const fetchUrl = streamUrl + (streamUrl.includes('?') ? '&' : '?') + `time=${Date.now()}`;
@@ -973,7 +1085,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 }
 
                 if (prevDecision === '#INCLUDE_NEXT') {
-                     segments.push(line.startsWith('http') ? line : baseUrl + line);
+                     const resolved = line.startsWith('http') ? line : baseUrl + line;
+                     if (isAllowedStreamUrl(resolved, baseStreamHost)) {
+                         segments.push(resolved);
+                     }
                 }
             }
         }
@@ -1018,6 +1133,11 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                         try {
                             // Use GET instead of HEAD as some CDNs block HEAD requests or return 403
                             // We don't need the full content yet, but standard fetch is safest for auth/existence check
+                            if (!isAllowedStreamUrl(nextSegUrl, baseStreamHost)) {
+                                consecutiveErrors++;
+                                continue;
+                            }
+
                             const checkRes = await fetch(nextSegUrl, { method: 'GET' }); // Changed HEAD to GET
                             
                             if (checkRes.ok) {
@@ -1105,8 +1225,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 // We have a handle from the user gesture at start
                 currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
                 writable = await handle.createWritable();
+                currentWritable = writable;
             } else {
                 console.warn('File System Access API not supported or Handle missing. Using IDB fallback.');
+                usedIdbFallback = true;
                 // Update overlay to warn user about memory usage
                 const overlayH2 = document.querySelector('#kick-vod-overlay h2');
                 if (overlayH2 && !overlayH2.textContent.includes('Temp Disk')) {
@@ -1228,6 +1350,8 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             return `${m}:${s.toString().padStart(2, '0')}`;
         };
 
+        let consecutiveFailures = 0;
+
         for (let i = 0; i < segments.length; i++) {
             if (cancelRequested) {
                 throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
@@ -1262,6 +1386,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                     transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
 
                     success = true;
+                    consecutiveFailures = 0;
 
                     // Update progress
                     const progress = Math.round(((i + 1) / segments.length) * 100);
@@ -1302,6 +1427,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                     if (err.message.includes('Download cancelled')) throw err;
 
                     attempt++;
+                    consecutiveFailures++;
                     console.error(`Error processing segment ${i} (Attempt ${attempt}/${maxRetries}):`, err);
                     
                     if (attempt >= maxRetries) {
@@ -1309,6 +1435,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                         // We skip this segment instead of failing the whole download. 
                         // The video will have a small jump/glitch but it's better than nothing.
                         break; 
+                    }
+
+                    if (consecutiveFailures >= 12) {
+                        throw new Error('Too many consecutive download failures. Aborting to prevent looping.');
                     }
 
                     // Wait before retry (Exponential Backoff: 1s, 2s, 4s, 8s... max 15s)
@@ -1338,10 +1468,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             await fileWriteChain;
             
             await writable.close();
+            currentWritable = null;
         } else {
             // Memory fallback: Create blob and trigger download
             console.log('Finalizing memory download... reading from IDB');
             updateOverlay(100, 'Assembling video file... / Ensamblando archivo de video...', 'This may take a minute... / Esto puede tardar un minuto...', totalBytes);
+            shouldClearChunks = true;
             
             // Add spinner
             const overlay = document.getElementById('kick-vod-overlay');
@@ -1370,40 +1502,49 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  alert('Error: Download seems empty. Please check console.');
             }
             
-            const blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
-            const blob = new Blob(chunks, { type: blobType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            const ext = isAudioOnly ? 'm4a' : 'mp4';
-            a.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
+            let blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
+            let blob = new Blob(chunks, { type: blobType });
+            let ext = isAudioOnly ? 'm4a' : 'mp4';
+
+            if (isAudioOnly && audioOnlyFormat === 'mp3') {
+                updateOverlay(100, 'Converting to MP3... / Convirtiendo a MP3...', 'This can take a while... / Esto puede tardar...', totalBytes);
+                try {
+                    blob = await convertM4aToMp3(blob);
+                    blobType = 'audio/mpeg';
+                    ext = 'mp3';
+                } catch (conversionError) {
+                    console.error('MP3 conversion failed, falling back to M4A:', conversionError);
+                    updateOverlay(100, 'MP3 conversion failed, saving M4A... / Falló MP3, guardando M4A...', '', totalBytes);
+                }
+            }
+
+            objectUrl = URL.createObjectURL(blob);
+            tempLink = document.createElement('a');
+            tempLink.style.display = 'none';
+            tempLink.href = objectUrl;
+            tempLink.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
+            document.body.appendChild(tempLink);
+            tempLink.click();
 
             // Removed manual alert and reload as requested
             // alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalice, recarga la página o cierra la pestaña.");
             
-            // Cleanup after a delay
+            // Cleanup after a short delay to allow the download to initialize
+            deferObjectUrlCleanup = true;
             setTimeout(() => {
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                clearChunksFromDB(); // Free disk space
-                
-                // No auto-reload
-                // window.location.reload();
-            }, 30000); // Increased timeout to give time for large file assembly/download start
+                if (tempLink && tempLink.parentNode) {
+                    tempLink.parentNode.removeChild(tempLink);
+                }
+                if (objectUrl) {
+                    URL.revokeObjectURL(objectUrl);
+                    objectUrl = null;
+                }
+            }, 1500);
         }
         
         sendNotification('Download Complete / Descarga Completa', `The VOD "${getVideoId() || 'video'}" has been downloaded successfully.`);
         updateButton(btn, 'Download Complete!', false);
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        currentFileHandle = null; // Prevent deletion on reload
-        currentWritable = null;
+        shouldResetState = true;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
         
@@ -1420,17 +1561,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         }, 4000);
 
     } catch (error) {
-        // Cleanup on error
-        if (currentWritable) await currentWritable.abort().catch(() => {});
-        if (currentFileHandle && currentFileHandle.remove) {
-            await currentFileHandle.remove().catch(() => {});
-        }
-        currentFileHandle = null;
-        currentWritable = null;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        clearHandleFromDB();
-        
+        // Flag cleanup on error
+        shouldRemoveFile = true;
+        shouldResetState = true;
+
         // Restore audio on error
         restorePageAudio();
 
@@ -1447,11 +1581,36 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             alert('Download failed: ' + error.message);
             updateButton(btn, 'Error', false);
         }
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        
         removeOverlay();
+    } finally {
+        if (currentWritable) {
+            try {
+                await currentWritable.abort();
+            } catch (_) {}
+            currentWritable = null;
+        }
+
+        if (shouldRemoveFile) {
+            await cleanupDownloadArtifacts({ clearChunks: false, removeFile: true });
+        }
+
+        if (shouldClearChunks || usedIdbFallback) {
+            await cleanupDownloadArtifacts({ clearChunks: true, removeFile: false });
+        }
+
+        if (!deferObjectUrlCleanup && tempLink && tempLink.parentNode) {
+            tempLink.parentNode.removeChild(tempLink);
+        }
+
+        if (!deferObjectUrlCleanup && objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+        }
+
+        clearHandleFromDB();
+
+        if (shouldResetState) {
+            resetDownloadState();
+        }
     }
 }
 
@@ -1587,15 +1746,20 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
                     qualitySelect.appendChild(opt);
                 });
                 
-                // Add "Solo Audio (M4A)" option (User Request)
+                // Add "Solo Audio" options
                 // Uses 360p or lowest quality variant as source, strips video track
                 const audioCandidate = variants.find(v => v.resolution && v.resolution.includes('360')) || variants[variants.length - 1];
                 if (audioCandidate) {
-                    const opt = document.createElement('option');
-                    opt.textContent = 'Solo Audio (M4A) - Experimental';
-                    opt.value = audioCandidate.url + '#audio_only';
-                    opt.style.color = '#53fc18'; // Highlight
-                    qualitySelect.appendChild(opt);
+                    const optMp3 = document.createElement('option');
+                    optMp3.textContent = 'Solo Audio (MP3) - Experimental';
+                    optMp3.value = audioCandidate.url + '#audio_only=mp3';
+                    optMp3.style.color = '#53fc18'; // Highlight
+                    qualitySelect.appendChild(optMp3);
+
+                    const optM4a = document.createElement('option');
+                    optM4a.textContent = 'Solo Audio (M4A)';
+                    optM4a.value = audioCandidate.url + '#audio_only=m4a';
+                    qualitySelect.appendChild(optM4a);
                 }
                 
                 qualitySelect.disabled = false;
@@ -1907,6 +2071,34 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
 // --- STREAMER MODE (AUTO-DOWNLOAD) ---
 let isStreamerModeEnabled = false;
 let streamEndDetected = false;
+let lastHostRejection = 0;
+
+function findHostRejectButton() {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const textMatches = (text) => {
+        const cleaned = text.toLowerCase();
+        return cleaned.includes('rechazar') || cleaned.includes('reject') || cleaned.includes('decline');
+    };
+
+    return candidates.find(btn => {
+        const label = btn.getAttribute('aria-label') || '';
+        const title = btn.getAttribute('title') || '';
+        const text = btn.textContent || '';
+        return textMatches(label) || textMatches(title) || textMatches(text);
+    });
+}
+
+function attemptRejectHost() {
+    if (!isStreamerModeEnabled) return;
+    const now = Date.now();
+    if (now - lastHostRejection < 2000) return;
+    const rejectBtn = findHostRejectButton();
+    if (rejectBtn && !rejectBtn.disabled) {
+        rejectBtn.click();
+        lastHostRejection = now;
+        console.log('[KVD] Host rejected while Auto-DL active.');
+    }
+}
 
 function isModerator() {
     // Dashboard: Always true (Access restricted to mods/streamers anyway)
@@ -2146,25 +2338,40 @@ function injectStreamerModeUI() {
          container.style.cssText = 'display: none; align-items: center; margin-left: 15px; margin-right: 15px; gap: 8px; z-index: 50;';
     }
     
-    // Toggle Switch
-    const toggle = document.createElement('div');
-    toggle.id = 'kvd-streamer-toggle';
-    toggle.title = 'Auto-download latest VOD when stream ends (Reloads page)';
-    toggle.style.cssText = 'width: 44px; height: 24px; background: #1a1a1a; border-radius: 12px; position: relative; cursor: pointer; border: 2px solid #555; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
-    
-    const knob = document.createElement('div');
-    knob.id = 'kvd-streamer-knob';
-    knob.style.cssText = 'width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: all 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);';
-    
-    toggle.appendChild(knob);
-    
-    // Label
-    const label = document.createElement('span');
-    label.textContent = 'Auto-DL';
-    label.style.cssText = 'font-size: 13px; font-weight: 700; color: #ccc; user-select: none;';
-    
-    container.appendChild(toggle);
-    container.appendChild(label);
+    let toggle = null;
+    let knob = null;
+    let label = null;
+
+    if (window.location.hostname === 'dashboard.kick.com') {
+        const button = document.createElement('button');
+        button.id = 'kvd-streamer-toggle';
+        button.type = 'button';
+        button.title = 'Auto-download latest VOD when stream ends';
+        button.textContent = 'Auto-DL';
+        button.style.cssText = 'background: #1a1a1a; color: #ccc; border: 2px solid #555; border-radius: 999px; padding: 6px 14px; font-weight: 700; cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+        container.appendChild(button);
+        toggle = button;
+    } else {
+        // Toggle Switch
+        toggle = document.createElement('div');
+        toggle.id = 'kvd-streamer-toggle';
+        toggle.title = 'Auto-download latest VOD when stream ends (Reloads page)';
+        toggle.style.cssText = 'width: 44px; height: 24px; background: #1a1a1a; border-radius: 12px; position: relative; cursor: pointer; border: 2px solid #555; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+        
+        knob = document.createElement('div');
+        knob.id = 'kvd-streamer-knob';
+        knob.style.cssText = 'width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: all 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);';
+        
+        toggle.appendChild(knob);
+        
+        // Label
+        label = document.createElement('span');
+        label.textContent = 'Auto-DL';
+        label.style.cssText = 'font-size: 13px; font-weight: 700; color: #ccc; user-select: none;';
+        
+        container.appendChild(toggle);
+        container.appendChild(label);
+    }
     
     // Insert based on position strategy
     if (insertPosition === 'before') {
@@ -2195,9 +2402,13 @@ function injectStreamerModeUI() {
         toggle.style.boxShadow = '0 0 10px rgba(83, 252, 24, 0.4)';
         toggle.classList.add('kvd-pulse-active');
         
-        knob.style.transform = 'translateX(20px)';
-        knob.style.background = '#53fc18';
-        label.style.color = '#53fc18';
+        if (knob) {
+            knob.style.transform = 'translateX(20px)';
+            knob.style.background = '#53fc18';
+        }
+        if (label) {
+            label.style.color = '#53fc18';
+        }
         
         streamEndDetected = false;
     };
@@ -2215,9 +2426,13 @@ function injectStreamerModeUI() {
         toggle.style.boxShadow = 'none';
         toggle.classList.remove('kvd-pulse-active');
         
-        knob.style.transform = 'translateX(0)';
-        knob.style.background = '#fff';
-        label.style.color = '#ccc';
+        if (knob) {
+            knob.style.transform = 'translateX(0)';
+            knob.style.background = '#fff';
+        }
+        if (label) {
+            label.style.color = '#ccc';
+        }
         
         streamEndDetected = false;
     };
@@ -2561,6 +2776,9 @@ setInterval(() => {
     }
     
     checkStreamStatus();
+    if (globalCheckCycle % 2 === 0) {
+        attemptRejectHost();
+    }
     // -------------------------------------------
     
     // Inject thumbnail buttons periodically (Every 5 seconds - Low Priority)
