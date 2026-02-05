@@ -2914,6 +2914,71 @@ function sendChatMessage(message) {
 }
 
 // --- Easter Eggs (Roadmap #28 & #29) & Custom Commands ---
+
+function parseBooleanSetting(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value !== 'string') return null;
+
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'enabled', 'exact'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off', 'disabled', 'partial', 'contains'].includes(normalized)) return false;
+    return null;
+}
+
+function getExactMatchSetting() {
+    const directKeys = [
+        'kvd_easter_egg_exact_match',
+        'kvd_easter_eggs_exact_match',
+        'kvd_tricks_exact_match',
+        'kvd_chat_exact_match',
+        'kvd_exact_match'
+    ];
+
+    for (const key of directKeys) {
+        const parsed = parseBooleanSetting(localStorage.getItem(key));
+        if (parsed !== null) return parsed;
+    }
+
+    const objectKeys = [
+        'kvd_settings',
+        'kvd_chat_settings',
+        'kvd_easter_egg_settings',
+        'kvd_tricks_settings'
+    ];
+
+    const nestedPaths = [
+        ['exactMatch'],
+        ['easterEggExactMatch'],
+        ['tricksExactMatch'],
+        ['chatExactMatch'],
+        ['easterEggs', 'exactMatch'],
+        ['tricks', 'exactMatch']
+    ];
+
+    for (const key of objectKeys) {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        try {
+            const obj = JSON.parse(raw);
+            for (const path of nestedPaths) {
+                let current = obj;
+                for (const segment of path) {
+                    current = current && current[segment];
+                }
+                const parsed = parseBooleanSetting(current);
+                if (parsed !== null) return parsed;
+            }
+        } catch (_) {}
+    }
+
+    return false;
+}
+
+function triggerMatches(cleanText, expectedText, exactMatchEnabled) {
+    return exactMatchEnabled ? cleanText === expectedText : cleanText.includes(expectedText);
+}
+
 function injectEasterEggs() {
     // Selector based on Roadmap line 30 & 41
     const chatInput = document.querySelector('div[data-testid="chat-input"][contenteditable="true"], div[data-input="true"][contenteditable="true"].editor-input');
@@ -2948,44 +3013,45 @@ function injectEasterEggs() {
             }
 
             // --- Easter Eggs ---
+            const exactMatchEnabled = getExactMatchSetting();
 
             // Roadmap #28: "Imaginate un cubo"
-            if (cleanText.includes('imaginate un cubo')) {
+            if (triggerMatches(cleanText, 'imaginate un cubo', exactMatchEnabled)) {
                 clearChat();
                 triggerCubeEasterEgg();
                 return; 
             }
 
             // "Contexto: No te imaginaste un cubo"
-            if (cleanText.includes('contexto: no te imaginaste un cubo')) {
+            if (triggerMatches(cleanText, 'contexto: no te imaginaste un cubo', exactMatchEnabled)) {
                 clearChat();
                 triggerCubeContextEasterEgg();
                 return;
             }
 
             // "Aguante Pavle"
-            if (cleanText.includes('aguante pavle')) {
+            if (triggerMatches(cleanText, 'aguante pavle', exactMatchEnabled)) {
                 clearChat();
                 triggerPavleEasterEgg();
                 return;
             }
 
             // "Mondongo"
-            if (cleanText.includes('mondongo')) {
+            if (triggerMatches(cleanText, 'mondongo', exactMatchEnabled)) {
                 clearChat();
                 triggerMondongoEasterEgg();
                 return;
             }
 
             // "Mambo"
-            if (cleanText.includes('mambo')) {
+            if (triggerMatches(cleanText, 'mambo', exactMatchEnabled)) {
                 clearChat();
                 triggerMamboEasterEgg();
                 return;
             }
 
             // "Una maroma!" (Barrel Roll)
-            if (cleanText.includes('una maroma!')) {
+            if (triggerMatches(cleanText, 'una maroma!', exactMatchEnabled)) {
                 clearChat();
                 document.body.classList.add('kvd-barrel-roll');
                 setTimeout(() => document.body.classList.remove('kvd-barrel-roll'), 1000);
@@ -2993,7 +3059,7 @@ function injectEasterEggs() {
             }
 
             // "me derrito lpm" (Melt)
-            if (cleanText.includes('me derrito lpm')) {
+            if (triggerMatches(cleanText, 'me derrito lpm', exactMatchEnabled)) {
                 clearChat();
                 document.body.classList.add('kvd-melt-effect');
                 // Wait for animation (4s) + a brief "empty" moment (1s)
@@ -3008,7 +3074,7 @@ function injectEasterEggs() {
             ];
             
             // Enable Admin Mode (Per Channel)
-            if (enableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (enableAdminTricks.some(trick => triggerMatches(cleanText, trick, exactMatchEnabled))) {
                 const slug = getChannelSlug();
                 if (!slug) return;
 
@@ -3040,7 +3106,7 @@ function injectEasterEggs() {
                 "ser admin me da ansiedad."
             ];
 
-            if (disableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (disableAdminTricks.some(trick => triggerMatches(cleanText, trick, exactMatchEnabled))) {
                 localStorage.removeItem('kvd_admin_channels');
                 localStorage.removeItem('kvd_admin_trick_enabled'); // Ensure global is gone too
                 
