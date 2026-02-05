@@ -1,7 +1,5 @@
 # Hoja de Ruta Futura (Roadmap)
 
-EL AGENTE NO DEBE EDITAR ESTE ARCHIVO, SÓLO LEERLO. EL USUARIO LO EDITARÁ CUANDO SEA NECESARIO.
-
 Este archivo rastrea las características planificadas, mejoras y problemas conocidos a abordar en futuras versiones de Kick VOD Downloader.
 
 ## 🔐 Seguridad y Calidad (Sugerencias)
@@ -48,10 +46,10 @@ Código del campo de texto del chat del panel de moderación: <div data-input="t
 - [x] **Notificaciones de Escritorio**: Implementar notificaciones nativas del navegador para avisar cuando una descarga finaliza o falla, útil si el usuario está en otra pestaña o aplicación. (Sólamente si el usuario NO está en la pestaña)
 - [x] **Selector de Calidad**: Añadir un selector en la interfaz para permitir a los usuarios elegir entre diferentes calidades de video disponibles para descargar. Esto podría mejorar la experiencia del usuario al adaptarse a sus necesidades y conexiones de red.
 - [PENDIENTE] **Protección contra Hosts**: Cuando el Auto-DL esté activo, la extensión buscará cada 2 segundos el botón de rechazar host y lo clickeará automáticamente. Esto evitará que el host bloquee la descarga automática por redirección. (código del botón sacado con la herramienta de "Inspeccionar" en la línea 45)
-(Estoy esperando a dar con un canal que esté por hostear a otro para sacar el código del botón)
+(Estoy esperando a dar con un canal que esté por hostear a otro para conseguir el código del botón)
 - [x] **Auto-Retry Mejorado**: Sistema más robusto de reintentos automáticos ante fallos de red temporales durante la descarga de chunks.
 - [ ] **Cambiar toggler de Auto-DL**: En el Dashboard del canal se debe cambiar el toggler a un botón que te redireccione al canal (desde https://dashboard.kick.com/moderator/CANAL a https://kick.com/CANAL) y active directamente el Auto-DL.
-- [ ] **
+
 
 ---
 
