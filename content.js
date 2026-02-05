@@ -768,6 +768,14 @@ function resetDownloadState() {
     currentWritable = null;
 }
 
+function isUserCancellationError(error) {
+    const name = typeof error?.name === 'string' ? error.name : '';
+    const message = typeof error?.message === 'string' ? error.message : String(error || '');
+    return name === 'AbortError'
+        || message.includes('user aborted')
+        || message.includes('cancelled by user');
+}
+
 async function cleanupDownloadArtifacts({ clearChunks = false, removeFile = false } = {}) {
     if (clearChunks) {
         await clearChunksFromDB();
@@ -1605,6 +1613,7 @@ Waiting ${Math.round(delay / 1000)}s`,
     } catch (error) {
         // Flag cleanup on error
         shouldRemoveFile = true;
+        shouldClearChunks = true;
         shouldResetState = true;
 
         // Restore audio on error
@@ -1613,7 +1622,7 @@ Waiting ${Math.round(delay / 1000)}s`,
         console.error('Download failed:', error);
         
         // Only alert if it's not a user cancellation
-        if (error.name === 'AbortError' || error.message.includes('user aborted') || error.message.includes('cancelled by user')) {
+        if (isUserCancellationError(error)) {
              updateButton(btn, 'Cancelled', false);
              console.log('Download cancelled. Cleaning up without reload...');
              setTimeout(() => setButtonToDownload(btn), 1500);
