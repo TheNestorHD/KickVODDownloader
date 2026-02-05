@@ -142,12 +142,13 @@ function restorePageAudio() {
 
 // IndexedDB Helper for robust cleanup and temporary storage
 const DB_NAME = 'KickDownloaderDB';
+const DB_VERSION = 3;
 const HANDLE_STORE = 'handles';
 const CHUNK_STORE = 'chunks';
 
 function openDB() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, 2); // Version 2
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
         request.onerror = () => reject(request.error);
         request.onsuccess = () => resolve(request.result);
         request.onupgradeneeded = (event) => {
