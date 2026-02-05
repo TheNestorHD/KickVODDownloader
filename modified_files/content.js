@@ -12,7 +12,7 @@ let originalPageTitle = '';
 const originalMediaStates = new Map();
 const extensionApi = typeof browser !== 'undefined' ? browser : chrome;
 
-let activeSegmentAbortController = null;
+const activeSegmentControllers = new Set();
 let hostRejectionInterval = null;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -53,10 +53,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
 }
 
 function resetActiveSegmentAbort() {
-    if (activeSegmentAbortController) {
-        activeSegmentAbortController.abort();
-        activeSegmentAbortController = null;
+    for (const controller of activeSegmentControllers) {
+        controller.abort();
     }
+    activeSegmentControllers.clear();
 }
 
 // --- Wake Lock / Inactivity Prevention ---
@@ -781,10 +781,13 @@ function sendNotification(title, message) {
     }
 }
 
-async function convertAudioBlobToWav(blob) {
+async function convertAudioBlobToMp3(blob) {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) {
         throw new Error('AudioContext not supported');
+    }
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('audio/mpeg')) {
+        throw new Error('MP3 encoding not supported by this browser');
     }
 
     const arrayBuffer = await blob.arrayBuffer();
@@ -792,71 +795,33 @@ async function convertAudioBlobToWav(blob) {
 
     try {
         const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-        const wavBuffer = audioBufferToWav(audioBuffer);
-        return new Blob([wavBuffer], { type: 'audio/wav' });
+        const destination = audioContext.createMediaStreamDestination();
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(destination);
+
+        const recorder = new MediaRecorder(destination.stream, { mimeType: 'audio/mpeg' });
+        const chunks = [];
+
+        return await new Promise((resolve, reject) => {
+            recorder.ondataavailable = (event) => {
+                if (event.data && event.data.size > 0) {
+                    chunks.push(event.data);
+                }
+            };
+            recorder.onerror = () => reject(new Error('MP3 conversion failed'));
+            recorder.onstop = () => resolve(new Blob(chunks, { type: 'audio/mpeg' }));
+
+            source.start(0);
+            recorder.start();
+
+            source.onended = () => {
+                recorder.stop();
+            };
+        });
     } finally {
         await audioContext.close().catch(() => {});
     }
-}
-
-function audioBufferToWav(audioBuffer) {
-    const numChannels = audioBuffer.numberOfChannels;
-    const sampleRate = audioBuffer.sampleRate;
-    const format = 1; // PCM
-    const bitDepth = 16;
-
-    const samples = audioBuffer.length;
-    const blockAlign = numChannels * bitDepth / 8;
-    const byteRate = sampleRate * blockAlign;
-    const dataSize = samples * blockAlign;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-
-    let offset = 0;
-    const writeString = (str) => {
-        for (let i = 0; i < str.length; i++) {
-            view.setUint8(offset + i, str.charCodeAt(i));
-        }
-        offset += str.length;
-    };
-
-    writeString('RIFF');
-    view.setUint32(offset, 36 + dataSize, true);
-    offset += 4;
-    writeString('WAVE');
-    writeString('fmt ');
-    view.setUint32(offset, 16, true);
-    offset += 4;
-    view.setUint16(offset, format, true);
-    offset += 2;
-    view.setUint16(offset, numChannels, true);
-    offset += 2;
-    view.setUint32(offset, sampleRate, true);
-    offset += 4;
-    view.setUint32(offset, byteRate, true);
-    offset += 4;
-    view.setUint16(offset, blockAlign, true);
-    offset += 2;
-    view.setUint16(offset, bitDepth, true);
-    offset += 2;
-    writeString('data');
-    view.setUint32(offset, dataSize, true);
-    offset += 4;
-
-    const channelData = [];
-    for (let channel = 0; channel < numChannels; channel++) {
-        channelData.push(audioBuffer.getChannelData(channel));
-    }
-
-    for (let i = 0; i < samples; i++) {
-        for (let channel = 0; channel < numChannels; channel++) {
-            const sample = Math.max(-1, Math.min(1, channelData[channel][i]));
-            view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-            offset += 2;
-        }
-    }
-
-    return buffer;
 }
 
 async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null, forceMemory = false, explicitVideoId = null, downloadOptions = {}) {
@@ -868,7 +833,9 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             streamUrl = streamUrl.replace('#audio_only', '');
             console.log('Audio Only Mode Detected (M4A/AAC)');
         }
-        const shouldConvertToWav = Boolean(downloadOptions.convertToWav && isAudioOnly);
+        const shouldConvertToMp3 = Boolean(downloadOptions.convertToMp3 && isAudioOnly);
+        const effectiveForceMemory = forceMemory || shouldConvertToMp3;
+        let finalOutputHandle = null;
 
         isDownloading = true;
         preventTabInactivity(); // Prevent tab sleep during download
@@ -885,7 +852,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         let handle = preOpenedHandle;
         
         // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle AND not forced memory mode
-        if (!forceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
+        if (!effectiveForceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
              try {
                  // Suggest filename
                  const ext = isAudioOnly ? 'm4a' : 'mp4';
@@ -915,6 +882,25 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  allowTabInactivity();
                  setButtonToDownload(btn);
                  return; // Stop execution
+             }
+        } else if (!handle && typeof window.showSaveFilePicker === 'function' && shouldConvertToMp3) {
+             try {
+                 const suggestedName = `kick-vod-${explicitVideoId || getVideoId() || 'audio'}.mp3`;
+                 handle = await window.showSaveFilePicker({
+                    suggestedName: suggestedName,
+                    types: [{
+                        description: 'MP3 Audio',
+                        accept: { 'audio/mpeg': ['.mp3'] },
+                    }],
+                });
+                finalOutputHandle = handle;
+                updateOverlay(0);
+             } catch (pickerError) {
+                console.log('User cancelled save picker or error:', pickerError);
+                isDownloading = false;
+                allowTabInactivity();
+                setButtonToDownload(btn);
+                return;
              }
         } else if (!handle) {
             // No API support or fallback needed later
@@ -1254,7 +1240,7 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         let memoryChunks = []; // Fallback for browsers without File System Access API (like Brave)
         
         try {
-            if (handle) {
+            if (handle && !shouldConvertToMp3 && !effectiveForceMemory) {
                 // We have a handle from the user gesture at start
                 currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
                 writable = await handle.createWritable();
@@ -1382,118 +1368,135 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             return `${m}:${s.toString().padStart(2, '0')}`;
         };
 
-        for (let i = 0; i < segments.length; i++) {
+        const maxConcurrentDownloads = 4;
+        const segmentBuffers = new Map();
+        let nextDownloadIndex = 0;
+        let processedIndex = 0;
+
+        const fetchSegmentWithRetry = async (index) => {
+            let attempt = 0;
+            const maxRetries = 20;
+
+            while (attempt < maxRetries) {
+                try {
+                    if (cancelRequested) throw new Error('Download cancelled');
+
+                    await waitForOnline();
+                    const controller = new AbortController();
+                    activeSegmentControllers.add(controller);
+                    let segRes;
+                    try {
+                        segRes = await fetchWithTimeout(
+                            segments[index],
+                            { signal: controller.signal },
+                            45000
+                        );
+                    } finally {
+                        activeSegmentControllers.delete(controller);
+                    }
+
+                    if (!segRes.ok) {
+                        throw new Error(`Failed to fetch segment ${index}, status: ${segRes.status}`);
+                    }
+
+                    const segData = await segRes.arrayBuffer();
+                    totalBytes += segData.byteLength;
+                    return new Uint8Array(segData);
+                } catch (err) {
+                    if (err.message.includes('Download cancelled')) throw err;
+                    if (err.name === 'AbortError') {
+                        console.warn(`Segment ${index} timed out. Retrying...`);
+                    }
+                    attempt++;
+                    console.error(`Error processing segment ${index} (Attempt ${attempt}/${maxRetries}):`, err);
+
+                    if (attempt >= maxRetries) {
+                        console.error(`Max retries reached for segment ${index}. Skipping... (Video might be glitchy)`);
+                        return null;
+                    }
+
+                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
+                    const jitter = Math.random() * 500;
+                    const delay = backoff + jitter;
+                    updateOverlay(
+                        lastProgress,
+                        `Connection Issue / Problema de Conexión`,
+                        `Retrying segment ${index}/${segments.length} (Attempt ${attempt}/${maxRetries})...\nWaiting ${Math.round(delay/1000)}s`,
+                        totalBytes,
+                        0
+                    );
+                    await sleep(delay);
+                }
+            }
+
+            return null;
+        };
+
+        const downloadWorker = async () => {
+            while (nextDownloadIndex < segments.length) {
+                const index = nextDownloadIndex++;
+                if (cancelRequested) break;
+                const data = await fetchSegmentWithRetry(index);
+                segmentBuffers.set(index, data);
+            }
+        };
+
+        const workers = Array.from({ length: Math.min(maxConcurrentDownloads, segments.length) }, () => downloadWorker());
+
+        while (processedIndex < segments.length) {
             if (cancelRequested) {
                 resetActiveSegmentAbort();
                 throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
             }
 
-            let attempt = 0;
-            const maxRetries = 20; // Increased retries for robustness
-            let success = false;
+            if (!segmentBuffers.has(processedIndex)) {
+                await sleep(50);
+                continue;
+            }
 
-            while (attempt < maxRetries && !success) {
-                try {
-                    if (cancelRequested) throw new Error('Download cancelled');
+            const segData = segmentBuffers.get(processedIndex);
+            segmentBuffers.delete(processedIndex);
 
-                    await waitForOnline();
-                    resetActiveSegmentAbort();
-                    activeSegmentAbortController = new AbortController();
-                    const segRes = await fetchWithTimeout(
-                        segments[i],
-                        { signal: activeSegmentAbortController.signal },
-                        45000
-                    );
-                    if (!segRes.ok) {
-                        // If 404, it might be permanent, but sometimes CDNs are weird. We retry.
-                        throw new Error(`Failed to fetch segment ${i}, status: ${segRes.status}`);
-                    }
-                    const segData = await segRes.arrayBuffer();
-                    
-                    // Track total bytes
-                    totalBytes += segData.byteLength;
-                    
-                    // Push to transmuxer
-                    // Fix for Firefox "Permission denied to access property constructor"
-                    // Clone data into a new Uint8Array created explicitly in this scope
-                    const sourceBytes = new Uint8Array(segData);
-                    const cleanBytes = new Uint8Array(sourceBytes.length);
-                    cleanBytes.set(sourceBytes);
+            if (segData) {
+                const cleanBytes = new Uint8Array(segData.length);
+                cleanBytes.set(segData);
 
-                    transmuxer.push(cleanBytes);
-                    transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
-                    activeSegmentAbortController = null;
+                transmuxer.push(cleanBytes);
+                transmuxer.flush();
+            }
 
-                    success = true;
+            processedIndex++;
 
-                    // Update progress
-                    const progress = Math.round(((i + 1) / segments.length) * 100);
-                    
-                    // Calculate instantaneous speed and ETA every ~1s or when progress changes
-                    const now = Date.now();
-                    const timeDiff = (now - lastSpeedTime) / 1000; // seconds
-                    
-                    // Calculate speed every second regardless of progress change
-                    if (timeDiff >= 1) { 
-                         const bytesDiff = totalBytes - lastSpeedBytes;
-                         currentSpeed = bytesDiff / timeDiff; // bytes per second
-                         lastSpeedTime = now;
-                         lastSpeedBytes = totalBytes;
-                    }
+            const progress = Math.round((processedIndex / segments.length) * 100);
+            const now = Date.now();
+            const timeDiff = (now - lastSpeedTime) / 1000;
 
-                    // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
-                    if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
-                        lastProgress = Math.max(lastProgress, progress); // Keep max progress
-                        lastUiUpdate = now;
-                        
-                        // Calculate ETA
-                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
-                        let etaText = 'Calculating time...';
-                        
-                        if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
-                            const rate = (i + 1) / elapsedTime; // segments per second
-                            const remainingSegments = segments.length - (i + 1);
-                            const etaSeconds = remainingSegments / rate;
-                            etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
-                        }
+            if (timeDiff >= 1) {
+                const bytesDiff = totalBytes - lastSpeedBytes;
+                currentSpeed = bytesDiff / timeDiff;
+                lastSpeedTime = now;
+                lastSpeedBytes = totalBytes;
+            }
 
-                        updateButton(btn, 'Downloading...', true, progress);
-                        updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
-                    }
+            if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
+                lastProgress = Math.max(lastProgress, progress);
+                lastUiUpdate = now;
 
-                } catch (err) {
-                    if (err.message.includes('Download cancelled')) throw err;
-                    if (err.name === 'AbortError') {
-                        console.warn(`Segment ${i} timed out. Retrying...`);
-                    }
-
-                    attempt++;
-                    console.error(`Error processing segment ${i} (Attempt ${attempt}/${maxRetries}):`, err);
-                    
-                    if (attempt >= maxRetries) {
-                        console.error(`Max retries reached for segment ${i}. Skipping... (Video might be glitchy)`);
-                        // We skip this segment instead of failing the whole download. 
-                        // The video will have a small jump/glitch but it's better than nothing.
-                        break; 
-                    }
-
-                    // Wait before retry (Exponential Backoff: 1s, 2s, 4s, 8s... max 15s)
-                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
-                    const jitter = Math.random() * 500;
-                    const delay = backoff + jitter;
-                    
-                    // Show retry status in overlay
-                    updateOverlay(lastProgress, 
-                        `Connection Issue / Problema de Conexión`, 
-                        `Retrying segment ${i}/${segments.length} (Attempt ${attempt}/${maxRetries})...\nWaiting ${Math.round(delay/1000)}s`, 
-                        totalBytes, 
-                        0 // Speed 0 while waiting
-                    );
-
-                    await sleep(delay);
+                const elapsedTime = (Date.now() - startTime) / 1000;
+                let etaText = 'Calculating time...';
+                if (elapsedTime > 2 && processedIndex > 0) {
+                    const rate = processedIndex / elapsedTime;
+                    const remainingSegments = segments.length - processedIndex;
+                    const etaSeconds = remainingSegments / rate;
+                    etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
                 }
+
+                updateButton(btn, 'Downloading...', true, progress);
+                updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
             }
         }
+
+        await Promise.all(workers);
 
         // 100% reached, but still writing/closing
         updateOverlay(100, 'Finalizing file writing... / Finalizando escritura del archivo...', 'Please wait / Por favor espere', totalBytes);
@@ -1545,45 +1548,58 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             
             const blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
             const blob = new Blob(chunks, { type: blobType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            const ext = isAudioOnly ? 'm4a' : 'mp4';
-            a.download = `${fileBaseName}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
-            audioSourceBlob = isAudioOnly ? blob : null;
 
-            // Removed manual alert and reload as requested
-            // alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalice, recarga la página o cierra la pestaña.");
-            
-            // Cleanup after a delay
-            setTimeout(() => {
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                clearChunksFromDB(); // Free disk space
+            if (isAudioOnly && shouldConvertToMp3) {
+                audioSourceBlob = blob;
+            } else {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                const ext = isAudioOnly ? 'm4a' : 'mp4';
+                a.download = `${fileBaseName}.${ext}`;
+                document.body.appendChild(a);
+                a.click();
+                audioSourceBlob = isAudioOnly ? blob : null;
+
+                // Removed manual alert and reload as requested
+                // alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalifique, recarga la página o cierra la pestaña.");
                 
-                // No auto-reload
-                // window.location.reload();
-            }, 30000); // Increased timeout to give time for large file assembly/download start
+                // Cleanup after a delay
+                setTimeout(() => {
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    clearChunksFromDB(); // Free disk space
+                    
+                    // No auto-reload
+                    // window.location.reload();
+                }, 30000); // Increased timeout to give time for large file assembly/download start
+            }
         }
 
-        if (shouldConvertToWav && audioSourceBlob) {
+        if (shouldConvertToMp3 && audioSourceBlob) {
             try {
-                updateOverlay(100, 'Converting audio to WAV... / Convirtiendo a WAV...', 'Please wait / Por favor espere', totalBytes);
-                const wavBlob = await convertAudioBlobToWav(audioSourceBlob);
-                const wavUrl = URL.createObjectURL(wavBlob);
-                const wavLink = document.createElement('a');
-                wavLink.style.display = 'none';
-                wavLink.href = wavUrl;
-                wavLink.download = `${fileBaseName}.wav`;
-                document.body.appendChild(wavLink);
-                wavLink.click();
-                setTimeout(() => {
-                    document.body.removeChild(wavLink);
-                    URL.revokeObjectURL(wavUrl);
-                }, 30000);
+                updateOverlay(100, 'Converting audio to MP3... / Convirtiendo a MP3...', 'Please wait / Por favor espere', totalBytes);
+                const mp3Blob = await convertAudioBlobToMp3(audioSourceBlob);
+
+                if (finalOutputHandle && finalOutputHandle.createWritable) {
+                    const writableMp3 = await finalOutputHandle.createWritable();
+                    const mp3Buffer = await mp3Blob.arrayBuffer();
+                    await writableMp3.write(mp3Buffer);
+                    await writableMp3.close();
+                } else {
+                    const mp3Url = URL.createObjectURL(mp3Blob);
+                    const mp3Link = document.createElement('a');
+                    mp3Link.style.display = 'none';
+                    mp3Link.href = mp3Url;
+                    mp3Link.download = `${fileBaseName}.mp3`;
+                    document.body.appendChild(mp3Link);
+                    mp3Link.click();
+                    setTimeout(() => {
+                        document.body.removeChild(mp3Link);
+                        URL.revokeObjectURL(mp3Url);
+                    }, 30000);
+                }
             } catch (error) {
                 console.error('Audio conversion failed:', error);
                 sendNotification('Audio Conversion Failed', `Error converting audio: ${error.message}`);
@@ -1709,7 +1725,7 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     audioConvertCheckbox.disabled = true;
     audioConvertCheckbox.style.accentColor = '#53fc18';
     audioConvertLabel.appendChild(audioConvertCheckbox);
-    audioConvertLabel.appendChild(document.createTextNode('Convert audio to WAV after download (Experimental)'));
+    audioConvertLabel.appendChild(document.createTextNode('Convert audio to MP3 after download (if supported)'));
     audioConvertContainer.appendChild(audioConvertLabel);
     content.appendChild(audioConvertContainer);
 
@@ -2067,7 +2083,7 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
                     null,
                     false,
                     videoId,
-                    { convertToWav: audioConvertCheckbox.checked }
+                    { convertToMp3: audioConvertCheckbox.checked }
                 );
         } else {
              alert('Could not fetch video source');
@@ -2128,7 +2144,7 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
                  null,
                  false,
                  videoId,
-                 { convertToWav: audioConvertCheckbox.checked }
+                 { convertToMp3: audioConvertCheckbox.checked }
              );
         } else {
              alert('Could not fetch video source');
@@ -2547,9 +2563,17 @@ function injectStreamerModeUI() {
     // Check for Carry-Over State (Redirected from Dashboard)
     if (!isDashboard && localStorage.getItem('kvd_auto_dl_carry_over') === 'true') {
         localStorage.removeItem('kvd_auto_dl_carry_over');
-        // Activate immediately without confirm
-        enableAutoDL();
-        console.log('[Streamer Mode] Auto-DL enabled via Dashboard redirect.');
+        const tryActivate = (remaining = 5) => {
+            if (toggle && isModerator() && !isOfflineVisible()) {
+                enableAutoDL();
+                console.log('[Streamer Mode] Auto-DL enabled via Dashboard redirect.');
+                return;
+            }
+            if (remaining > 0) {
+                setTimeout(() => tryActivate(remaining - 1), 800);
+            }
+        };
+        setTimeout(() => tryActivate(), 800);
     }
 }
 
