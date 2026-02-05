@@ -118,8 +118,12 @@ async function withStore(storeName, mode, operation) {
             return;
         }
 
-        tx.oncomplete = () => resolve(result);
+        const resultPromise = Promise.resolve(result);
+        tx.oncomplete = () => {
+            resultPromise.then(resolve).catch(reject);
+        };
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
     });
 }
 
@@ -742,14 +746,85 @@ function sendNotification(title, message) {
     }
 }
 
+function resetDownloadState() {
+    isDownloading = false;
+    allowTabInactivity();
+    cancelRequested = false;
+    currentDownloadVideoId = null;
+    currentDownloadPath = null;
+    currentFileHandle = null;
+    currentWritable = null;
+}
+
+async function cleanupDownloadArtifacts({ clearChunks = false, removeFile = false } = {}) {
+    if (clearChunks) {
+        await clearChunksFromDB();
+    }
+    if (removeFile && currentFileHandle && currentFileHandle.remove) {
+        await currentFileHandle.remove().catch(e => console.error('Remove failed', e));
+    }
+}
+
+async function convertM4aToMp3(blob) {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('audio/mpeg')) {
+        throw new Error('MP3 encoding not supported in this browser');
+    }
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const destination = audioContext.createMediaStreamDestination();
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(destination);
+
+    const recorder = new MediaRecorder(destination.stream, { mimeType: 'audio/mpeg' });
+    const chunks = [];
+
+    const recordPromise = new Promise((resolve, reject) => {
+        recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                chunks.push(event.data);
+            }
+        };
+        recorder.onerror = (event) => reject(event.error || event);
+        recorder.onstop = () => resolve(new Blob(chunks, { type: 'audio/mpeg' }));
+    });
+
+    recorder.start();
+    source.start(0);
+
+    const durationMs = Math.max(0, audioBuffer.duration * 1000);
+    await new Promise(resolve => setTimeout(resolve, durationMs + 250));
+    recorder.stop();
+    source.stop();
+    audioContext.close().catch(() => {});
+
+    return recordPromise;
+}
+
 async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null, forceMemory = false, explicitVideoId = null) {
+    let isAudioOnly = false;
+    let audioOnlyFormat = null;
+    let usedIdbFallback = false;
+    let shouldClearChunks = false;
+    let shouldRemoveFile = false;
+    let objectUrl = null;
+    let tempLink = null;
+    let shouldResetState = false;
+    let deferObjectUrlCleanup = false;
+
     try {
         // Check for Audio Only mode (passed via URL hash)
-        let isAudioOnly = false;
-        if (streamUrl.endsWith('#audio_only')) {
+        if (streamUrl.includes('#audio_only')) {
             isAudioOnly = true;
-            streamUrl = streamUrl.replace('#audio_only', '');
-            console.log('Audio Only Mode Detected (M4A/AAC)');
+            const match = streamUrl.match(/#audio_only(?:=(mp3|m4a))?/i);
+            audioOnlyFormat = match && match[1] ? match[1].toLowerCase() : 'm4a';
+            streamUrl = streamUrl.replace(/#audio_only(?:=[^#]*)?/i, '');
+            console.log(`Audio Only Mode Detected (${audioOnlyFormat?.toUpperCase() || 'M4A/AAC'})`);
+        }
+
+        if (audioOnlyFormat === 'mp3') {
+            forceMemory = true;
         }
 
         isDownloading = true;
@@ -762,9 +837,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             originalPageTitle = document.title;
         }
 
+
         // --- FILE PICKER MOVED HERE TO SATISFY USER GESTURE REQUIREMENT ---
         // We must ask for the file handle immediately, before any network requests (fetch)
         let handle = preOpenedHandle;
+
+        if (forceMemory) {
+            handle = null;
+        }
         
         // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle AND not forced memory mode
         if (!forceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
@@ -1117,8 +1197,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 // We have a handle from the user gesture at start
                 currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
                 writable = await handle.createWritable();
+                currentWritable = writable;
             } else {
                 console.warn('File System Access API not supported or Handle missing. Using IDB fallback.');
+                usedIdbFallback = true;
                 // Update overlay to warn user about memory usage
                 const overlayH2 = document.querySelector('#kick-vod-overlay h2');
                 if (overlayH2 && !overlayH2.textContent.includes('Temp Disk')) {
@@ -1350,10 +1432,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             await fileWriteChain;
             
             await writable.close();
+            currentWritable = null;
         } else {
             // Memory fallback: Create blob and trigger download
             console.log('Finalizing memory download... reading from IDB');
             updateOverlay(100, 'Assembling video file... / Ensamblando archivo de video...', 'This may take a minute... / Esto puede tardar un minuto...', totalBytes);
+            shouldClearChunks = true;
             
             // Add spinner
             const overlay = document.getElementById('kick-vod-overlay');
@@ -1382,40 +1466,49 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  alert('Error: Download seems empty. Please check console.');
             }
             
-            const blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
-            const blob = new Blob(chunks, { type: blobType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            const ext = isAudioOnly ? 'm4a' : 'mp4';
-            a.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
+            let blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
+            let blob = new Blob(chunks, { type: blobType });
+            let ext = isAudioOnly ? 'm4a' : 'mp4';
+
+            if (isAudioOnly && audioOnlyFormat === 'mp3') {
+                updateOverlay(100, 'Converting to MP3... / Convirtiendo a MP3...', 'This can take a while... / Esto puede tardar...', totalBytes);
+                try {
+                    blob = await convertM4aToMp3(blob);
+                    blobType = 'audio/mpeg';
+                    ext = 'mp3';
+                } catch (conversionError) {
+                    console.error('MP3 conversion failed, falling back to M4A:', conversionError);
+                    updateOverlay(100, 'MP3 conversion failed, saving M4A... / Falló MP3, guardando M4A...', '', totalBytes);
+                }
+            }
+
+            objectUrl = URL.createObjectURL(blob);
+            tempLink = document.createElement('a');
+            tempLink.style.display = 'none';
+            tempLink.href = objectUrl;
+            tempLink.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
+            document.body.appendChild(tempLink);
+            tempLink.click();
 
             // Removed manual alert and reload as requested
             // alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalice, recarga la página o cierra la pestaña.");
             
-            // Cleanup after a delay
+            // Cleanup after a short delay to allow the download to initialize
+            deferObjectUrlCleanup = true;
             setTimeout(() => {
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                clearChunksFromDB(); // Free disk space
-                
-                // No auto-reload
-                // window.location.reload();
-            }, 30000); // Increased timeout to give time for large file assembly/download start
+                if (tempLink && tempLink.parentNode) {
+                    tempLink.parentNode.removeChild(tempLink);
+                }
+                if (objectUrl) {
+                    URL.revokeObjectURL(objectUrl);
+                    objectUrl = null;
+                }
+            }, 1500);
         }
         
         sendNotification('Download Complete / Descarga Completa', `The VOD "${getVideoId() || 'video'}" has been downloaded successfully.`);
         updateButton(btn, 'Download Complete!', false);
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        currentFileHandle = null; // Prevent deletion on reload
-        currentWritable = null;
+        shouldResetState = true;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
         
@@ -1432,17 +1525,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
         }, 4000);
 
     } catch (error) {
-        // Cleanup on error
-        if (currentWritable) await currentWritable.abort().catch(() => {});
-        if (currentFileHandle && currentFileHandle.remove) {
-            await currentFileHandle.remove().catch(() => {});
-        }
-        currentFileHandle = null;
-        currentWritable = null;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        clearHandleFromDB();
-        
+        // Flag cleanup on error
+        shouldRemoveFile = true;
+        shouldResetState = true;
+
         // Restore audio on error
         restorePageAudio();
 
@@ -1459,11 +1545,36 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             alert('Download failed: ' + error.message);
             updateButton(btn, 'Error', false);
         }
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        
         removeOverlay();
+    } finally {
+        if (currentWritable) {
+            try {
+                await currentWritable.abort();
+            } catch (_) {}
+            currentWritable = null;
+        }
+
+        if (shouldRemoveFile) {
+            await cleanupDownloadArtifacts({ clearChunks: false, removeFile: true });
+        }
+
+        if (shouldClearChunks || usedIdbFallback) {
+            await cleanupDownloadArtifacts({ clearChunks: true, removeFile: false });
+        }
+
+        if (!deferObjectUrlCleanup && tempLink && tempLink.parentNode) {
+            tempLink.parentNode.removeChild(tempLink);
+        }
+
+        if (!deferObjectUrlCleanup && objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+        }
+
+        clearHandleFromDB();
+
+        if (shouldResetState) {
+            resetDownloadState();
+        }
     }
 }
 
@@ -1599,15 +1710,20 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
                     qualitySelect.appendChild(opt);
                 });
                 
-                // Add "Solo Audio (M4A)" option (User Request)
+                // Add "Solo Audio" options
                 // Uses 360p or lowest quality variant as source, strips video track
                 const audioCandidate = variants.find(v => v.resolution && v.resolution.includes('360')) || variants[variants.length - 1];
                 if (audioCandidate) {
-                    const opt = document.createElement('option');
-                    opt.textContent = 'Solo Audio (M4A) - Experimental';
-                    opt.value = audioCandidate.url + '#audio_only';
-                    opt.style.color = '#53fc18'; // Highlight
-                    qualitySelect.appendChild(opt);
+                    const optMp3 = document.createElement('option');
+                    optMp3.textContent = 'Solo Audio (MP3) - Experimental';
+                    optMp3.value = audioCandidate.url + '#audio_only=mp3';
+                    optMp3.style.color = '#53fc18'; // Highlight
+                    qualitySelect.appendChild(optMp3);
+
+                    const optM4a = document.createElement('option');
+                    optM4a.textContent = 'Solo Audio (M4A)';
+                    optM4a.value = audioCandidate.url + '#audio_only=m4a';
+                    qualitySelect.appendChild(optM4a);
                 }
                 
                 qualitySelect.disabled = false;
