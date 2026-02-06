@@ -16,6 +16,13 @@ const originalMediaStates = new Map();
 let wakeLockAudioContext = null;
 let wakeLockOscillator = null;
 let wakeLockCount = 0;
+const WAKE_LOCK_DEFAULT_FREQ_HZ = 22000;
+
+function getWakeLockFrequencyHz() {
+    const raw = Number(localStorage.getItem('kvd_wake_lock_freq_hz'));
+    if (!Number.isFinite(raw)) return WAKE_LOCK_DEFAULT_FREQ_HZ;
+    return Math.max(1, Math.min(22000, Math.round(raw)));
+}
 
 function preventTabInactivity() {
     wakeLockCount++;
@@ -30,10 +37,14 @@ function preventTabInactivity() {
         wakeLockAudioContext = new AudioContext();
         wakeLockOscillator = wakeLockAudioContext.createOscillator();
         const gainNode = wakeLockAudioContext.createGain();
-        
-        // Ultra-low volume (effectively silent) but keeps audio thread active
-        gainNode.gain.value = 0.001; 
-        
+
+        wakeLockOscillator.type = 'sine';
+        wakeLockOscillator.frequency.value = getWakeLockFrequencyHz();
+
+        // Practically silent output while keeping the audio thread active.
+        // Default frequency is ultrasonic (22kHz) to avoid audible tones.
+        gainNode.gain.value = 0.00001;
+
         wakeLockOscillator.connect(gainNode);
         gainNode.connect(wakeLockAudioContext.destination);
         wakeLockOscillator.start();
@@ -97,6 +108,36 @@ const DB_NAME = 'KickDownloaderDB';
 const HANDLE_STORE = 'handles';
 const CHUNK_STORE = 'chunks';
 
+function requestToPromise(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function withStore(storeName, mode, operation) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, mode);
+        const store = tx.objectStore(storeName);
+        let result;
+
+        try {
+            result = operation(store);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+
+        const resultPromise = Promise.resolve(result);
+        tx.oncomplete = () => {
+            resultPromise.then(resolve).catch(reject);
+        };
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+    });
+}
+
 function openDB() {
     return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, 2); // Version 2
@@ -116,36 +157,35 @@ function openDB() {
 
 async function saveHandleToDB(handle) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).put(handle, 'interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.put(handle, 'interrupted_download');
         });
     } catch (e) { console.error('DB Save Handle Error', e); }
 }
 
 async function clearHandleFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(HANDLE_STORE, 'readwrite');
-        tx.objectStore(HANDLE_STORE).delete('interrupted_download');
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(HANDLE_STORE, 'readwrite', (store) => {
+            store.delete('interrupted_download');
         });
     } catch (e) { console.error('DB Clear Handle Error', e); }
 }
 
+async function getHandleFromDB() {
+    try {
+        return await withStore(HANDLE_STORE, 'readonly', (store) => {
+            return requestToPromise(store.get('interrupted_download'));
+        });
+    } catch (e) {
+        console.error('DB Get Handle Error', e);
+        return null;
+    }
+}
+
 async function saveChunkToDB(chunk) {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).add(chunk);
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.add(chunk);
         });
     } catch (e) { 
         console.error('DB Save Chunk Error', e);
@@ -155,26 +195,16 @@ async function saveChunkToDB(chunk) {
 
 async function clearChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readwrite');
-        tx.objectStore(CHUNK_STORE).clear();
-        return new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
+        await withStore(CHUNK_STORE, 'readwrite', (store) => {
+            store.clear();
         });
     } catch (e) { console.error('DB Clear Chunks Error', e); }
 }
 
 async function getAllChunksFromDB() {
     try {
-        const db = await openDB();
-        const tx = db.transaction(CHUNK_STORE, 'readonly');
-        const store = tx.objectStore(CHUNK_STORE);
-        const request = store.getAll();
-        
-        return new Promise((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
+        return await withStore(CHUNK_STORE, 'readonly', (store) => {
+            return requestToPromise(store.getAll());
         });
     } catch (e) {
         console.error('DB Get All Chunks Error', e);
@@ -231,6 +261,11 @@ function showFirstKickVisitAlert() {
 // Run cleanup check on load
 checkAndCleanup();
 showFirstKickVisitAlert();
+initFollowButtonEffects();
+
+const isValidRuntimeMessage = (sender, request) => {
+    return sender && sender.id === chrome.runtime.id && request && typeof request.type === 'string';
+};
 
 // Cleanup on page reload/close
 const handleUnload = () => {
@@ -252,6 +287,7 @@ window.addEventListener('pagehide', handleUnload);
 
 // Listen for messages from background script (Navigation detection) and Popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!isValidRuntimeMessage(sender, request)) return;
     // --- POPUP: Admin Check ---
     if (request.type === 'CHECK_ADMIN') {
         sendResponse({ isAdmin: isModerator() });
@@ -266,7 +302,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     // --- POPUP: Send Chat ---
     if (request.type === 'SEND_CHAT') {
-        sendChatMessage(request.message);
+        if (typeof request.message === 'string' && request.message.trim()) {
+            const safeMessage = request.message.slice(0, 500);
+            sendChatMessage(safeMessage);
+        }
         return true;
     }
 });
@@ -730,14 +769,105 @@ function sendNotification(title, message) {
     }
 }
 
+function isAllowedStreamUrl(url, baseHost) {
+    try {
+        const parsed = new URL(url, window.location.href);
+        if (!['https:', 'http:'].includes(parsed.protocol)) return false;
+        if (!baseHost) return true;
+        return parsed.hostname === baseHost || parsed.hostname.endsWith(`.${baseHost}`);
+    } catch (e) {
+        console.warn('Invalid stream URL detected:', url, e);
+        return false;
+    }
+}
+
+function resetDownloadState() {
+    isDownloading = false;
+    allowTabInactivity();
+    cancelRequested = false;
+    currentDownloadVideoId = null;
+    currentDownloadPath = null;
+    currentFileHandle = null;
+    currentWritable = null;
+}
+
+function isUserCancellationError(error) {
+    const name = typeof error?.name === 'string' ? error.name : '';
+    const message = typeof error?.message === 'string' ? error.message : String(error || '');
+    return name === 'AbortError'
+        || message.includes('user aborted')
+        || message.includes('cancelled by user');
+}
+
+async function cleanupDownloadArtifacts({ clearChunks = false, removeFile = false } = {}) {
+    if (clearChunks) {
+        await clearChunksFromDB();
+    }
+    if (removeFile && currentFileHandle && currentFileHandle.remove) {
+        await currentFileHandle.remove().catch(e => console.error('Remove failed', e));
+    }
+}
+
+async function convertM4aToMp3(blob) {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('audio/mpeg')) {
+        throw new Error('MP3 encoding not supported in this browser');
+    }
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const destination = audioContext.createMediaStreamDestination();
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(destination);
+
+    const recorder = new MediaRecorder(destination.stream, { mimeType: 'audio/mpeg' });
+    const chunks = [];
+
+    const recordPromise = new Promise((resolve, reject) => {
+        recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                chunks.push(event.data);
+            }
+        };
+        recorder.onerror = (event) => reject(event.error || event);
+        recorder.onstop = () => resolve(new Blob(chunks, { type: 'audio/mpeg' }));
+    });
+
+    recorder.start();
+    source.start(0);
+
+    const durationMs = Math.max(0, audioBuffer.duration * 1000);
+    await new Promise(resolve => setTimeout(resolve, durationMs + 250));
+    recorder.stop();
+    source.stop();
+    audioContext.close().catch(() => {});
+
+    return recordPromise;
+}
+
 async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 0, endSeconds = -1, preOpenedHandle = null, forceMemory = false, explicitVideoId = null) {
+    let isAudioOnly = false;
+    let audioOnlyFormat = null;
+    let usedIdbFallback = false;
+    let shouldClearChunks = false;
+    let shouldRemoveFile = false;
+    let objectUrl = null;
+    let tempLink = null;
+    let shouldResetState = false;
+    let deferObjectUrlCleanup = false;
+
     try {
         // Check for Audio Only mode (passed via URL hash)
-        let isAudioOnly = false;
-        if (streamUrl.endsWith('#audio_only')) {
+        if (streamUrl.includes('#audio_only')) {
             isAudioOnly = true;
-            streamUrl = streamUrl.replace('#audio_only', '');
-            console.log('Audio Only Mode Detected (M4A/AAC)');
+            const match = streamUrl.match(/#audio_only(?:=(mp3|m4a))?/i);
+            audioOnlyFormat = match && match[1] ? match[1].toLowerCase() : 'm4a';
+            streamUrl = streamUrl.replace(/#audio_only(?:=[^#]*)?/i, '');
+            console.log(`Audio Only Mode Detected (${audioOnlyFormat?.toUpperCase() || 'M4A/AAC'})`);
+        }
+
+        if (audioOnlyFormat === 'mp3') {
+            forceMemory = true;
         }
 
         isDownloading = true;
@@ -750,9 +880,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             originalPageTitle = document.title;
         }
 
+
         // --- FILE PICKER MOVED HERE TO SATISFY USER GESTURE REQUIREMENT ---
         // We must ask for the file handle immediately, before any network requests (fetch)
         let handle = preOpenedHandle;
+
+        if (forceMemory) {
+            handle = null;
+        }
         
         // Only ask if we don't have a handle AND we support the API AND it's not a recursive call with handle AND not forced memory mode
         if (!forceMemory && !handle && typeof window.showSaveFilePicker === 'function') {
@@ -803,6 +938,14 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 console.log(`Using DOM Video Duration as fallback: ${videoDurationMs}ms`);
             }
         }
+
+        const baseStreamHost = (() => {
+            try {
+                return new URL(streamUrl).hostname;
+            } catch {
+                return null;
+            }
+        })();
 
         // 1. Fetch playlist with Cache Buster to avoid stale CDNs
         const fetchUrl = streamUrl + (streamUrl.includes('?') ? '&' : '?') + `time=${Date.now()}`;
@@ -973,7 +1116,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 }
 
                 if (prevDecision === '#INCLUDE_NEXT') {
-                     segments.push(line.startsWith('http') ? line : baseUrl + line);
+                     const resolved = line.startsWith('http') ? line : baseUrl + line;
+                     if (isAllowedStreamUrl(resolved, baseStreamHost)) {
+                         segments.push(resolved);
+                     }
                 }
             }
         }
@@ -1018,6 +1164,11 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                         try {
                             // Use GET instead of HEAD as some CDNs block HEAD requests or return 403
                             // We don't need the full content yet, but standard fetch is safest for auth/existence check
+                            if (!isAllowedStreamUrl(nextSegUrl, baseStreamHost)) {
+                                consecutiveErrors++;
+                                continue;
+                            }
+
                             const checkRes = await fetch(nextSegUrl, { method: 'GET' }); // Changed HEAD to GET
                             
                             if (checkRes.ok) {
@@ -1105,8 +1256,10 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                 // We have a handle from the user gesture at start
                 currentDownloadVideoId = getVideoId(); // Track video ID for navigation detection
                 writable = await handle.createWritable();
+                currentWritable = writable;
             } else {
                 console.warn('File System Access API not supported or Handle missing. Using IDB fallback.');
+                usedIdbFallback = true;
                 // Update overlay to warn user about memory usage
                 const overlayH2 = document.querySelector('#kick-vod-overlay h2');
                 if (overlayH2 && !overlayH2.textContent.includes('Temp Disk')) {
@@ -1228,69 +1381,115 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             return `${m}:${s.toString().padStart(2, '0')}`;
         };
 
-        for (let i = 0; i < segments.length; i++) {
-            if (cancelRequested) {
-                throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
-            }
+        let consecutiveFailures = 0;
+        let nextFetchIndex = 0;
+        let nextProcessIndex = 0;
+        const pendingSegments = new Map();
+        let processError = null;
+        let pendingTransmuxSegments = 0;
 
+        const maxRetries = 20;
+        const networkHint = (navigator.connection && navigator.connection.downlink) ? navigator.connection.downlink : 0;
+        const adaptiveBase = networkHint >= 200 ? 20 : networkHint >= 100 ? 14 : networkHint >= 50 ? 10 : 8;
+        const userCap = Number(localStorage.getItem('kvd_max_segment_connections') || adaptiveBase);
+        const downloadConcurrency = Math.max(4, Math.min(24, Number.isFinite(userCap) ? userCap : adaptiveBase));
+        const transmuxFlushEvery = 4;
+        console.log(`[Download] Using ${downloadConcurrency} concurrent segment connections.`);
+
+        async function fetchSegmentWithRetry(index) {
             let attempt = 0;
-            const maxRetries = 20; // Increased retries for robustness
-            let success = false;
-
-            while (attempt < maxRetries && !success) {
+            while (attempt < maxRetries) {
                 try {
                     if (cancelRequested) throw new Error('Download cancelled');
 
-                    const segRes = await fetch(segments[i]);
+                    const segRes = await fetch(segments[index]);
                     if (!segRes.ok) {
-                        // If 404, it might be permanent, but sometimes CDNs are weird. We retry.
-                        throw new Error(`Failed to fetch segment ${i}, status: ${segRes.status}`);
+                        throw new Error(`Failed to fetch segment ${index}, status: ${segRes.status}`);
                     }
-                    const segData = await segRes.arrayBuffer();
-                    
-                    // Track total bytes
-                    totalBytes += segData.byteLength;
-                    
-                    // Push to transmuxer
-                    // Fix for Firefox "Permission denied to access property constructor"
-                    // Clone data into a new Uint8Array created explicitly in this scope
-                    const sourceBytes = new Uint8Array(segData);
-                    const cleanBytes = new Uint8Array(sourceBytes.length);
-                    cleanBytes.set(sourceBytes);
+                    return await segRes.arrayBuffer();
+                } catch (err) {
+                    if ((err.message || '').includes('Download cancelled')) throw err;
 
-                    transmuxer.push(cleanBytes);
-                    transmuxer.flush(); // Flush after each segment to keep memory low and write immediately
+                    attempt++;
+                    console.error(`Error fetching segment ${index} (Attempt ${attempt}/${maxRetries}):`, err);
 
-                    success = true;
+                    if (attempt >= maxRetries) {
+                        console.error(`Max retries reached for segment ${index}. Skipping... (Video might be glitchy)`);
+                        return null;
+                    }
 
-                    // Update progress
-                    const progress = Math.round(((i + 1) / segments.length) * 100);
-                    
-                    // Calculate instantaneous speed and ETA every ~1s or when progress changes
+                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
+                    const jitter = Math.random() * 500;
+                    const delay = backoff + jitter;
+
+                    updateOverlay(lastProgress,
+                        `Connection Issue / Problema de Conexión`,
+                        `Retrying segment ${index}/${segments.length} (Attempt ${attempt}/${maxRetries})...
+Waiting ${Math.round(delay / 1000)}s`,
+                        totalBytes,
+                        0
+                    );
+
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            return null;
+        }
+
+        let processChain = Promise.resolve();
+        const processPendingSegments = () => {
+            processChain = processChain.then(async () => {
+                while (pendingSegments.has(nextProcessIndex)) {
+                    if (cancelRequested) {
+                        throw new Error('Download cancelled by user / Descarga cancelada por el usuario');
+                    }
+
+                    const segData = pendingSegments.get(nextProcessIndex);
+                    pendingSegments.delete(nextProcessIndex);
+
+                    if (segData) {
+                        totalBytes += segData.byteLength;
+                        const sourceBytes = new Uint8Array(segData);
+                        const cleanBytes = new Uint8Array(sourceBytes.length);
+                        cleanBytes.set(sourceBytes);
+
+                        transmuxer.push(cleanBytes);
+                        pendingTransmuxSegments++;
+
+                        const processedCount = nextProcessIndex + 1;
+                        const isLastSegment = processedCount >= segments.length;
+                        if (pendingTransmuxSegments >= transmuxFlushEvery || isLastSegment) {
+                            transmuxer.flush();
+                            pendingTransmuxSegments = 0;
+                        }
+                        consecutiveFailures = 0;
+                    } else {
+                        consecutiveFailures++;
+                    }
+
+                    const processedCount = nextProcessIndex + 1;
+                    const progress = Math.round((processedCount / segments.length) * 100);
                     const now = Date.now();
-                    const timeDiff = (now - lastSpeedTime) / 1000; // seconds
-                    
-                    // Calculate speed every second regardless of progress change
-                    if (timeDiff >= 1) { 
-                         const bytesDiff = totalBytes - lastSpeedBytes;
-                         currentSpeed = bytesDiff / timeDiff; // bytes per second
-                         lastSpeedTime = now;
-                         lastSpeedBytes = totalBytes;
+                    const timeDiff = (now - lastSpeedTime) / 1000;
+
+                    if (timeDiff >= 1) {
+                        const bytesDiff = totalBytes - lastSpeedBytes;
+                        currentSpeed = bytesDiff / timeDiff;
+                        lastSpeedTime = now;
+                        lastSpeedBytes = totalBytes;
                     }
 
-                    // Update DOM if percentage changed OR it's been >1s since last update (to show speed/size changes)
                     if (progress > lastProgress || (now - lastUiUpdate > 1000)) {
-                        lastProgress = Math.max(lastProgress, progress); // Keep max progress
+                        lastProgress = Math.max(lastProgress, progress);
                         lastUiUpdate = now;
-                        
-                        // Calculate ETA
-                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
+
+                        const elapsedTime = (Date.now() - startTime) / 1000;
                         let etaText = 'Calculating time...';
-                        
-                        if (elapsedTime > 2 && i > 0) { // Wait a bit for stable calculation
-                            const rate = (i + 1) / elapsedTime; // segments per second
-                            const remainingSegments = segments.length - (i + 1);
-                            const etaSeconds = remainingSegments / rate;
+
+                        if (elapsedTime > 2 && processedCount > 0) {
+                            const rate = processedCount / elapsedTime;
+                            const remainingSegments = segments.length - processedCount;
+                            const etaSeconds = remainingSegments / Math.max(rate, 0.01);
                             etaText = `Estimated time remaining: ${formatTime(etaSeconds)}`;
                         }
 
@@ -1298,35 +1497,43 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                         updateOverlay(progress, 'Downloading VOD / Descargando VOD', etaText, totalBytes, currentSpeed);
                     }
 
-                } catch (err) {
-                    if (err.message.includes('Download cancelled')) throw err;
-
-                    attempt++;
-                    console.error(`Error processing segment ${i} (Attempt ${attempt}/${maxRetries}):`, err);
-                    
-                    if (attempt >= maxRetries) {
-                        console.error(`Max retries reached for segment ${i}. Skipping... (Video might be glitchy)`);
-                        // We skip this segment instead of failing the whole download. 
-                        // The video will have a small jump/glitch but it's better than nothing.
-                        break; 
+                    if (consecutiveFailures >= 12) {
+                        throw new Error('Too many consecutive download failures. Aborting to prevent looping.');
                     }
 
-                    // Wait before retry (Exponential Backoff: 1s, 2s, 4s, 8s... max 15s)
-                    const backoff = Math.min(1000 * Math.pow(1.5, attempt), 15000);
-                    const jitter = Math.random() * 500;
-                    const delay = backoff + jitter;
-                    
-                    // Show retry status in overlay
-                    updateOverlay(lastProgress, 
-                        `Connection Issue / Problema de Conexión`, 
-                        `Retrying segment ${i}/${segments.length} (Attempt ${attempt}/${maxRetries})...\nWaiting ${Math.round(delay/1000)}s`, 
-                        totalBytes, 
-                        0 // Speed 0 while waiting
-                    );
-
-                    await new Promise(resolve => setTimeout(resolve, delay));
+                    nextProcessIndex++;
                 }
+            });
+            return processChain;
+        };
+
+        const worker = async () => {
+            while (true) {
+                if (processError) break;
+                const index = nextFetchIndex;
+                nextFetchIndex++;
+                if (index >= segments.length) break;
+
+                const segData = await fetchSegmentWithRetry(index);
+                pendingSegments.set(index, segData);
+                processPendingSegments().catch((e) => {
+                    processError = e;
+                });
             }
+        };
+
+        const workers = Array.from({ length: downloadConcurrency }, () => worker());
+        await Promise.all(workers);
+        await processPendingSegments();
+        if (processError) throw processError;
+
+        if (pendingTransmuxSegments > 0) {
+            transmuxer.flush();
+            pendingTransmuxSegments = 0;
+        }
+
+        if (nextProcessIndex < segments.length) {
+            throw new Error('Some segments were not processed correctly.');
         }
 
         // 100% reached, but still writing/closing
@@ -1338,10 +1545,12 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
             await fileWriteChain;
             
             await writable.close();
+            currentWritable = null;
         } else {
             // Memory fallback: Create blob and trigger download
             console.log('Finalizing memory download... reading from IDB');
             updateOverlay(100, 'Assembling video file... / Ensamblando archivo de video...', 'This may take a minute... / Esto puede tardar un minuto...', totalBytes);
+            shouldClearChunks = true;
             
             // Add spinner
             const overlay = document.getElementById('kick-vod-overlay');
@@ -1370,88 +1579,114 @@ async function downloadSegments(streamUrl, btn, videoDurationMs, startSeconds = 
                  alert('Error: Download seems empty. Please check console.');
             }
             
-            const blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
-            const blob = new Blob(chunks, { type: blobType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            const ext = isAudioOnly ? 'm4a' : 'mp4';
-            a.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
+            let blobType = isAudioOnly ? 'audio/mp4' : 'video/mp4';
+            let blob = new Blob(chunks, { type: blobType });
+            let ext = isAudioOnly ? 'm4a' : 'mp4';
+
+            if (isAudioOnly && audioOnlyFormat === 'mp3') {
+                updateOverlay(100, 'Converting to MP3... / Convirtiendo a MP3...', 'This can take a while... / Esto puede tardar...', totalBytes);
+                try {
+                    blob = await convertM4aToMp3(blob);
+                    blobType = 'audio/mpeg';
+                    ext = 'mp3';
+                } catch (conversionError) {
+                    console.error('MP3 conversion failed, falling back to M4A:', conversionError);
+                    updateOverlay(100, 'MP3 conversion failed, saving M4A... / Falló MP3, guardando M4A...', '', totalBytes);
+                }
+            }
+
+            objectUrl = URL.createObjectURL(blob);
+            tempLink = document.createElement('a');
+            tempLink.style.display = 'none';
+            tempLink.href = objectUrl;
+            tempLink.download = `kick-vod-${getVideoId() || 'video'}.${ext}`;
+            document.body.appendChild(tempLink);
+            tempLink.click();
 
             // Removed manual alert and reload as requested
             // alert("When the download finishes, reload the page or close the tab.\n\nCuando la descarga finalice, recarga la página o cierra la pestaña.");
             
-            // Cleanup after a delay
+            // Cleanup after a short delay to allow the download to initialize
+            deferObjectUrlCleanup = true;
             setTimeout(() => {
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                clearChunksFromDB(); // Free disk space
-                
-                // No auto-reload
-                // window.location.reload();
-            }, 30000); // Increased timeout to give time for large file assembly/download start
+                if (tempLink && tempLink.parentNode) {
+                    tempLink.parentNode.removeChild(tempLink);
+                }
+                if (objectUrl) {
+                    URL.revokeObjectURL(objectUrl);
+                    objectUrl = null;
+                }
+            }, 1500);
         }
         
         sendNotification('Download Complete / Descarga Completa', `The VOD "${getVideoId() || 'video'}" has been downloaded successfully.`);
         updateButton(btn, 'Download Complete!', false);
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        currentFileHandle = null; // Prevent deletion on reload
-        currentWritable = null;
+        shouldResetState = true;
+        shouldClearChunks = true;
         clearHandleFromDB();
         removeOverlay(); // Remove overlay on success
         
-        // Restore audio after successful download (before reload)
+        // Restore audio after successful download
         restorePageAudio();
 
-        setTimeout(async () => {
+        setTimeout(() => {
              setButtonToDownload(btn);
-             // Force reload to clear memory/state and prevent bugs
-             try {
-                 await clearChunksFromDB(); 
-             } catch (e) { console.error(e); }
-             window.location.reload();
-        }, 4000);
+        }, 2500);
 
     } catch (error) {
-        // Cleanup on error
-        if (currentWritable) await currentWritable.abort().catch(() => {});
-        if (currentFileHandle && currentFileHandle.remove) {
-            await currentFileHandle.remove().catch(() => {});
-        }
-        currentFileHandle = null;
-        currentWritable = null;
-        currentDownloadVideoId = null;
-        currentDownloadPath = null;
-        clearHandleFromDB();
-        
+        // Flag cleanup on error
+        shouldRemoveFile = true;
+        shouldClearChunks = true;
+        shouldResetState = true;
+
         // Restore audio on error
         restorePageAudio();
 
         console.error('Download failed:', error);
         
         // Only alert if it's not a user cancellation
-        if (error.name === 'AbortError' || error.message.includes('user aborted') || error.message.includes('cancelled by user')) {
+        if (isUserCancellationError(error)) {
              updateButton(btn, 'Cancelled', false);
-             // Reload immediately as requested
-             console.log('Download cancelled. Reloading page to cleanup...');
-             window.location.reload();
+             console.log('Download cancelled. Cleaning up without reload...');
+             setTimeout(() => setButtonToDownload(btn), 1500);
         } else {
             sendNotification('Download Failed / Error de Descarga', `Error: ${error.message}`);
             alert('Download failed: ' + error.message);
             updateButton(btn, 'Error', false);
         }
-        isDownloading = false;
-        allowTabInactivity();
-        cancelRequested = false;
-        
         removeOverlay();
+    } finally {
+        if (currentWritable) {
+            try {
+                await currentWritable.abort();
+            } catch (_) {}
+            currentWritable = null;
+        }
+
+        if (shouldRemoveFile) {
+            await cleanupDownloadArtifacts({ clearChunks: false, removeFile: true });
+        }
+
+        if (shouldClearChunks || usedIdbFallback) {
+            await cleanupDownloadArtifacts({ clearChunks: true, removeFile: false });
+        }
+
+        // Defensive cleanup to avoid stale chunks from interrupted sessions
+        await clearChunksFromDB().catch(() => {});
+
+        if (!deferObjectUrlCleanup && tempLink && tempLink.parentNode) {
+            tempLink.parentNode.removeChild(tempLink);
+        }
+
+        if (!deferObjectUrlCleanup && objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+        }
+
+        clearHandleFromDB();
+
+        if (shouldResetState) {
+            resetDownloadState();
+        }
     }
 }
 
@@ -1587,15 +1822,20 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
                     qualitySelect.appendChild(opt);
                 });
                 
-                // Add "Solo Audio (M4A)" option (User Request)
+                // Add "Solo Audio" options
                 // Uses 360p or lowest quality variant as source, strips video track
                 const audioCandidate = variants.find(v => v.resolution && v.resolution.includes('360')) || variants[variants.length - 1];
                 if (audioCandidate) {
-                    const opt = document.createElement('option');
-                    opt.textContent = 'Solo Audio (M4A) - Experimental';
-                    opt.value = audioCandidate.url + '#audio_only';
-                    opt.style.color = '#53fc18'; // Highlight
-                    qualitySelect.appendChild(opt);
+                    const optMp3 = document.createElement('option');
+                    optMp3.textContent = 'Solo Audio (MP3) - Experimental';
+                    optMp3.value = audioCandidate.url + '#audio_only=mp3';
+                    optMp3.style.color = '#53fc18'; // Highlight
+                    qualitySelect.appendChild(optMp3);
+
+                    const optM4a = document.createElement('option');
+                    optM4a.textContent = 'Solo Audio (M4A)';
+                    optM4a.value = audioCandidate.url + '#audio_only=m4a';
+                    qualitySelect.appendChild(optM4a);
                 }
                 
                 qualitySelect.disabled = false;
@@ -1904,9 +2144,480 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     };
 }
 
+let isUnfollowEffectRunning = false;
+
+function injectFollowEffectsStyles() {
+    if (document.getElementById('kvd-follow-effects-style')) return;
+    const style = document.createElement('style');
+    style.id = 'kvd-follow-effects-style';
+    style.textContent = `
+        .kvd-confetti-piece {
+            position: fixed;
+            width: 8px;
+            height: 12px;
+            border-radius: 2px;
+            pointer-events: none;
+            z-index: 999999;
+            will-change: transform, opacity;
+        }
+        .kvd-unfollow-crack-overlay {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 999998;
+            opacity: 0;
+            background-image:
+                linear-gradient(115deg, transparent 47%, rgba(255,255,255,0.85) 49%, transparent 51%),
+                linear-gradient(68deg, transparent 42%, rgba(255,255,255,0.7) 44%, transparent 46%),
+                linear-gradient(20deg, transparent 58%, rgba(255,255,255,0.75) 60%, transparent 62%);
+            animation: kvdCrackFlash 420ms ease-out forwards;
+        }
+        .kvd-unfollow-breaking {
+            animation: kvdPageBreak 1.5s ease-in forwards;
+            transform-origin: center top;
+            overflow: hidden;
+        }
+        .kvd-unfollow-fade-in {
+            animation: kvdPageRebuild 420ms ease-out forwards;
+        }
+        @keyframes kvdCrackFlash {
+            0% { opacity: 0; }
+            25% { opacity: 0.85; }
+            100% { opacity: 0; }
+        }
+        @keyframes kvdPageBreak {
+            0% { transform: translateY(0) scale(1); filter: none; opacity: 1; }
+            18% { transform: translateY(0) translateX(-5px) rotate(-0.3deg); }
+            42% { transform: translateY(18px) translateX(6px) rotate(0.25deg) scale(0.995); }
+            70% { transform: translateY(55vh) rotate(-0.7deg) scale(0.98); opacity: 0.8; }
+            100% { transform: translateY(115vh) rotate(-1.1deg) scale(0.96); opacity: 0; }
+        }
+        @keyframes kvdPageRebuild {
+            0% { opacity: 0; transform: translateY(8px) scale(0.997); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function triggerFollowConfetti(button) {
+    const rect = button.getBoundingClientRect();
+    const startX = rect.left + (rect.width / 2);
+    const startY = rect.top + (rect.height / 2);
+    const colors = ['#53fc18', '#ffffff', '#00d4ff', '#ffcf40', '#ff4d6d'];
+
+    for (let i = 0; i < 36; i++) {
+        const piece = document.createElement('div');
+        piece.className = 'kvd-confetti-piece';
+        piece.style.left = `${startX}px`;
+        piece.style.top = `${startY}px`;
+        piece.style.background = colors[i % colors.length];
+        piece.style.transform = `rotate(${Math.random() * 360}deg)`;
+        document.body.appendChild(piece);
+
+        const angle = (Math.PI * 2 * i) / 36;
+        const distance = 90 + Math.random() * 170;
+        const driftX = Math.cos(angle) * distance;
+        const driftY = Math.sin(angle) * distance + 120 + Math.random() * 120;
+
+        const animation = piece.animate([
+            { transform: `translate(0, 0) rotate(0deg)`, opacity: 1 },
+            { transform: `translate(${driftX}px, ${driftY}px) rotate(${360 + Math.random() * 540}deg)`, opacity: 0 }
+        ], {
+            duration: 800 + Math.random() * 500,
+            easing: 'cubic-bezier(0.12, 0.75, 0.25, 1)',
+            fill: 'forwards'
+        });
+
+        animation.onfinish = () => piece.remove();
+    }
+}
+
+function triggerUnfollowBreakEffect() {
+    if (isUnfollowEffectRunning) return;
+    isUnfollowEffectRunning = true;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'kvd-unfollow-crack-overlay';
+    document.body.appendChild(overlay);
+
+    document.body.classList.add('kvd-unfollow-breaking');
+
+    setTimeout(() => {
+        document.body.classList.remove('kvd-unfollow-breaking');
+        document.body.classList.add('kvd-unfollow-fade-in');
+        requestAnimationFrame(() => {
+            setTimeout(() => {
+                document.body.classList.remove('kvd-unfollow-fade-in');
+                overlay.remove();
+                isUnfollowEffectRunning = false;
+            }, 450);
+        });
+    }, 1500);
+}
+
+function initFollowButtonEffects() {
+    if (window.__kvdFollowEffectsBound) return;
+    window.__kvdFollowEffectsBound = true;
+    injectFollowEffectsStyles();
+
+    document.addEventListener('click', (event) => {
+        const followButton = event.target.closest('button[data-testid="follow-button"]');
+        if (followButton && !followButton.disabled) {
+            triggerFollowConfetti(followButton);
+            return;
+        }
+
+        const maybeUnfollowButton = event.target.closest('button.bg-negative-base.text-negative-onNegative');
+        if (maybeUnfollowButton && !maybeUnfollowButton.disabled) {
+            triggerUnfollowBreakEffect();
+        }
+    }, true);
+}
+
+
+// --- LIVE AUTO-DL (in-progress + realtime capture) ---
+let autoDlLiveModeEnabled = false;
+let liveAutoDlState = null;
+
+function resolvePlaylistUrl(baseUrl, line) {
+    return line.startsWith('http') ? line : new URL(line, baseUrl).toString();
+}
+
+function parseMasterVariants(masterText, baseUrl) {
+    const lines = masterText.split('\n').map(l => l.trim()).filter(Boolean);
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+        const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+        const nextLine = lines[i + 1];
+        if (!nextLine || nextLine.startsWith('#')) continue;
+        variants.push({
+            bandwidth: bwMatch ? Number(bwMatch[1]) : 0,
+            url: resolvePlaylistUrl(baseUrl, nextLine)
+        });
+    }
+    return variants;
+}
+
+function parseMediaPlaylist(playlistText, playlistUrl) {
+    const lines = playlistText.split('\n').map(l => l.trim()).filter(Boolean);
+    let mediaSequence = 0;
+    let targetDuration = 4;
+    let seqCursor = 0;
+    const segments = [];
+
+    for (const line of lines) {
+        if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+            mediaSequence = Number(line.split(':')[1]) || 0;
+            seqCursor = mediaSequence;
+            continue;
+        }
+        if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+            targetDuration = Number(line.split(':')[1]) || targetDuration;
+            continue;
+        }
+        if (line.startsWith('#')) continue;
+        segments.push({ seq: seqCursor, url: resolvePlaylistUrl(playlistUrl, line) });
+        seqCursor++;
+    }
+
+    return {
+        segments,
+        targetDuration,
+        ended: lines.includes('#EXT-X-ENDLIST')
+    };
+}
+
+async function fetchLiveSourceForChannel(slug) {
+    const response = await fetch(`https://kick.com/api/v1/channels/${slug}`, { credentials: 'include' });
+    if (!response.ok) throw new Error(`Channel API failed (${response.status})`);
+    const data = await response.json();
+
+    const possible = [
+        data?.livestream?.playback_url,
+        data?.livestream?.playbackUrl,
+        data?.livestream?.source,
+        data?.playback_url,
+        data?.stream_url,
+        data?.livestream?.hls_url
+    ].filter(Boolean);
+
+    if (!possible.length) {
+        throw new Error('Live stream source unavailable.');
+    }
+
+    return possible[0];
+}
+
+function ensureLiveAutoDlInfoWindow() {
+    let panel = document.getElementById('kvd-live-auto-dl-panel');
+    if (panel) return panel;
+
+    panel = document.createElement('div');
+    panel.id = 'kvd-live-auto-dl-panel';
+    panel.style.cssText = [
+        'position:fixed',
+        'top:92px',
+        'right:16px',
+        'width:250px',
+        'background:rgba(16,16,16,0.92)',
+        'color:#fff',
+        'border:1px solid rgba(83,252,24,0.7)',
+        'border-radius:10px',
+        'padding:8px 10px 10px',
+        'font-family:Inter,system-ui,sans-serif',
+        'font-size:12px',
+        'line-height:1.35',
+        'z-index:999999',
+        'box-shadow:0 10px 30px rgba(0,0,0,0.35)',
+        'user-select:none'
+    ].join(';');
+
+    panel.innerHTML = `
+        <div id="kvd-live-auto-dl-header" style="cursor:move;font-weight:700;color:#53fc18;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px;">
+            <span>🚀 Live Auto-DL</span>
+            <span style="opacity:.8">drag</span>
+        </div>
+        <div id="kvd-live-auto-dl-progress" style="margin-bottom:3px;">Progress: 0%</div>
+        <div id="kvd-live-auto-dl-size" style="margin-bottom:3px;">Size: 0 Bytes</div>
+        <div id="kvd-live-auto-dl-speed" style="margin-bottom:3px;">Speed: 0 B/s</div>
+        <div id="kvd-live-auto-dl-segments" style="opacity:.85;">Segments: 0 / 0</div>
+    `;
+
+    const header = panel.querySelector('#kvd-live-auto-dl-header');
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    const onMove = (event) => {
+        if (!dragging) return;
+        panel.style.left = `${event.clientX - offsetX}px`;
+        panel.style.top = `${event.clientY - offsetY}px`;
+        panel.style.right = 'auto';
+    };
+
+    const onUp = () => {
+        dragging = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    };
+
+    header.addEventListener('mousedown', (event) => {
+        dragging = true;
+        const rect = panel.getBoundingClientRect();
+        offsetX = event.clientX - rect.left;
+        offsetY = event.clientY - rect.top;
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+
+    document.body.appendChild(panel);
+    return panel;
+}
+
+function updateLiveAutoDlInfoWindow({ downloadedSegments = 0, visibleSegments = 0, bytes = 0, speed = 0 } = {}) {
+    const panel = ensureLiveAutoDlInfoWindow();
+    const progressPct = visibleSegments > 0 ? Math.min(100, Math.round((downloadedSegments / visibleSegments) * 100)) : 0;
+
+    const progressEl = panel.querySelector('#kvd-live-auto-dl-progress');
+    const sizeEl = panel.querySelector('#kvd-live-auto-dl-size');
+    const speedEl = panel.querySelector('#kvd-live-auto-dl-speed');
+    const segEl = panel.querySelector('#kvd-live-auto-dl-segments');
+
+    if (progressEl) progressEl.textContent = `Progress: ${progressPct}%`;
+    if (sizeEl) sizeEl.textContent = `Size: ${formatBytes(bytes)}`;
+    if (speedEl) speedEl.textContent = `Speed: ${formatBytes(Math.max(0, speed))}/s`;
+    if (segEl) segEl.textContent = `Segments: ${downloadedSegments} / ${visibleSegments}`;
+}
+
+function removeLiveAutoDlInfoWindow() {
+    const panel = document.getElementById('kvd-live-auto-dl-panel');
+    if (panel) panel.remove();
+}
+
+async function stopLiveAutoDlCapture(reason = 'manual') {
+    if (!liveAutoDlState) return;
+    liveAutoDlState.stopRequested = true;
+    const completion = liveAutoDlState.completionPromise;
+    if (completion) {
+        try { await completion; } catch (e) { console.warn('[Live Auto-DL] stop wait error', e); }
+    }
+    if (reason === 'offline') {
+        sendNotification('✅ Live Auto-DL finished', 'Stream ended and file was finalized.');
+    }
+}
+
+async function startLiveAutoDlCapture(slug, handle) {
+    if (!slug || !handle || liveAutoDlState?.active) return;
+
+    const state = {
+        active: true,
+        stopRequested: false,
+        downloadedSeq: new Set(),
+        completionPromise: null,
+        bytesDownloaded: 0,
+        speedBytesPerSecond: 0,
+        lastSpeedSampleTs: Date.now(),
+        lastSpeedSampleBytes: 0,
+        maxVisibleSeq: 0
+    };
+    liveAutoDlState = state;
+    updateLiveAutoDlInfoWindow({ downloadedSegments: 0, visibleSegments: 0, bytes: 0, speed: 0 });
+
+    state.completionPromise = (async () => {
+        let writable = null;
+        let transmuxer = null;
+        let writeQueue = Promise.resolve();
+        let initWritten = false;
+
+        try {
+            let masterUrl = await fetchLiveSourceForChannel(slug);
+            let playlistUrl = masterUrl;
+
+            const masterText = await (await fetch(masterUrl, { cache: 'no-store', credentials: 'include' })).text();
+            if (masterText.includes('#EXT-X-STREAM-INF')) {
+                const variants = parseMasterVariants(masterText, masterUrl);
+                if (variants.length) {
+                    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+                    playlistUrl = variants[0].url;
+                }
+            }
+
+            writable = await handle.createWritable();
+            currentFileHandle = handle;
+            currentWritable = writable;
+
+            transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
+            transmuxer.on('data', (segment) => {
+                writeQueue = writeQueue.then(async () => {
+                    if (!initWritten && segment.initSegment) {
+                        await writable.write(segment.initSegment);
+                        initWritten = true;
+                        state.bytesDownloaded += segment.initSegment.byteLength || 0;
+                    }
+                    if (segment.data) {
+                        await writable.write(segment.data);
+                        state.bytesDownloaded += segment.data.byteLength || 0;
+                    }
+
+                    const now = Date.now();
+                    const elapsedMs = now - state.lastSpeedSampleTs;
+                    if (elapsedMs >= 800) {
+                        const bytesDelta = state.bytesDownloaded - state.lastSpeedSampleBytes;
+                        state.speedBytesPerSecond = (bytesDelta * 1000) / elapsedMs;
+                        state.lastSpeedSampleTs = now;
+                        state.lastSpeedSampleBytes = state.bytesDownloaded;
+                    }
+
+                    updateLiveAutoDlInfoWindow({
+                        downloadedSegments: state.downloadedSeq.size,
+                        visibleSegments: state.maxVisibleSeq,
+                        bytes: state.bytesDownloaded,
+                        speed: state.speedBytesPerSecond
+                    });
+                });
+            });
+
+            while (!state.stopRequested && isStreamerModeEnabled && autoDlLiveModeEnabled) {
+                const playlistRes = await fetch(playlistUrl, { cache: 'no-store', credentials: 'include' });
+                if (!playlistRes.ok) throw new Error(`Playlist fetch failed (${playlistRes.status})`);
+                const playlistText = await playlistRes.text();
+                const parsed = parseMediaPlaylist(playlistText, playlistUrl);
+                state.maxVisibleSeq = Math.max(state.maxVisibleSeq, parsed.segments.length);
+
+                updateLiveAutoDlInfoWindow({
+                    downloadedSegments: state.downloadedSeq.size,
+                    visibleSegments: state.maxVisibleSeq,
+                    bytes: state.bytesDownloaded,
+                    speed: state.speedBytesPerSecond
+                });
+
+                for (const seg of parsed.segments) {
+                    if (state.stopRequested) break;
+                    if (state.downloadedSeq.has(seg.seq)) continue;
+
+                    const segRes = await fetch(seg.url, { cache: 'no-store', credentials: 'include' });
+                    if (!segRes.ok) continue;
+                    const bytes = new Uint8Array(await segRes.arrayBuffer());
+                    transmuxer.push(bytes);
+                    transmuxer.flush();
+                    state.downloadedSeq.add(seg.seq);
+                }
+
+                await writeQueue;
+
+                if (parsed.ended) break;
+                const waitMs = Math.max(1500, Math.min(8000, parsed.targetDuration * 1000));
+                await new Promise(r => setTimeout(r, waitMs));
+            }
+
+            if (transmuxer) transmuxer.flush();
+            await writeQueue;
+            await writable.close();
+            currentWritable = null;
+            currentFileHandle = null;
+        } catch (error) {
+            console.error('[Live Auto-DL] Capture error:', error);
+            if (writable) {
+                try { await writable.abort(); } catch (_) {}
+            }
+            currentWritable = null;
+            currentFileHandle = null;
+            sendNotification('❌ Live Auto-DL error', error?.message || 'Unexpected error');
+        } finally {
+            state.active = false;
+            liveAutoDlState = null;
+            removeLiveAutoDlInfoWindow();
+        }
+    })();
+
+    return state.completionPromise;
+}
+
 // --- STREAMER MODE (AUTO-DOWNLOAD) ---
 let isStreamerModeEnabled = false;
 let streamEndDetected = false;
+let lastHostRejection = 0;
+const AUTO_DL_ENABLED_KEY = 'kvd_auto_dl_enabled';
+const AUTO_DL_PENDING_KEY = 'kvd_auto_dl_pending';
+const AUTO_DL_CHANNEL_KEY = 'kvd_channel_slug';
+const AUTO_DL_CARRY_OVER_KEY = 'kvd_auto_dl_carry_over';
+
+function clearAutoDLPersistence() {
+    localStorage.removeItem(AUTO_DL_PENDING_KEY);
+    localStorage.removeItem(AUTO_DL_CHANNEL_KEY);
+    localStorage.removeItem(AUTO_DL_CARRY_OVER_KEY);
+    localStorage.removeItem(AUTO_DL_ENABLED_KEY);
+}
+
+function findHostRejectButton() {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const textMatches = (text) => {
+        const cleaned = text.toLowerCase();
+        return cleaned.includes('rechazar') || cleaned.includes('reject') || cleaned.includes('decline');
+    };
+
+    return candidates.find(btn => {
+        const label = btn.getAttribute('aria-label') || '';
+        const title = btn.getAttribute('title') || '';
+        const text = btn.textContent || '';
+        return textMatches(label) || textMatches(title) || textMatches(text);
+    });
+}
+
+function attemptRejectHost() {
+    if (!isStreamerModeEnabled) return;
+    const now = Date.now();
+    if (now - lastHostRejection < 2000) return;
+    const rejectBtn = findHostRejectButton();
+    if (rejectBtn && !rejectBtn.disabled) {
+        rejectBtn.click();
+        lastHostRejection = now;
+        console.log('[KVD] Host rejected while Auto-DL active.');
+    }
+}
 
 function isModerator() {
     // Dashboard: Always true (Access restricted to mods/streamers anyway)
@@ -1933,32 +2644,51 @@ function getChannelSlug() {
 }
 
 // Check for pending auto-download on load (Post-Reload Logic)
-async function checkAutoDownloadTrigger() {
-    if (localStorage.getItem('kvd_auto_dl_pending') === 'true') {
+async function checkPendingAutoDownloadTrigger() {
+    if (localStorage.getItem(AUTO_DL_PENDING_KEY) === 'true') {
+        if (localStorage.getItem(AUTO_DL_ENABLED_KEY) !== 'true') {
+            localStorage.removeItem(AUTO_DL_PENDING_KEY);
+            localStorage.removeItem(AUTO_DL_CHANNEL_KEY);
+            console.log('[Streamer Mode] Pending Auto-DL ignored because toggler is disabled.');
+            return;
+        }
+
         console.log('[Streamer Mode] Pending auto-download detected. Starting process...');
-        localStorage.removeItem('kvd_auto_dl_pending');
+        localStorage.removeItem(AUTO_DL_PENDING_KEY);
         
-        const slug = localStorage.getItem('kvd_channel_slug') || getChannelSlug();
+        const slug = localStorage.getItem(AUTO_DL_CHANNEL_KEY) || getChannelSlug();
         if (!slug) return;
 
         // Floating Status UI
         const statusDiv = document.createElement('div');
+        statusDiv.id = 'kvd-auto-dl-status';
         statusDiv.style.cssText = 'position: fixed; top: 80px; right: 20px; background: rgba(0,0,0,0.9); color: #53fc18; padding: 20px; border-radius: 8px; z-index: 99999; font-family: "Inter", sans-serif; border: 2px solid #53fc18; box-shadow: 0 0 20px rgba(83, 252, 24, 0.3); font-size: 14px; max-width: 300px;';
         statusDiv.innerHTML = '<strong>🚀 Auto-DL Active</strong><br>Waiting for VOD generation (2m)...<br>Esperando generación del VOD (2m)...';
         document.body.appendChild(statusDiv);
 
         // Wait 2 minutes for VOD to be generated by Kick backend
-        await new Promise(resolve => {
+        const stillEnabled = await new Promise(resolve => {
             let secondsLeft = 120;
             const timer = setInterval(() => {
+                if (localStorage.getItem(AUTO_DL_ENABLED_KEY) !== 'true') {
+                    clearInterval(timer);
+                    resolve(false);
+                    return;
+                }
+
                 secondsLeft--;
                 statusDiv.innerHTML = `<strong>🚀 Auto-DL Active</strong><br>Waiting for VOD generation...<br>Esperando generación del VOD...<br>⏱️ ${secondsLeft}s`;
                 if (secondsLeft <= 0) {
                     clearInterval(timer);
-                    resolve();
+                    resolve(true);
                 }
             }, 1000);
         });
+
+        if (!stillEnabled) {
+            statusDiv.remove();
+            return;
+        }
 
         statusDiv.innerHTML = '<strong>🚀 Auto-DL Active</strong><br>Searching for latest VOD...<br>Buscando último VOD...';
 
@@ -1985,12 +2715,16 @@ async function checkAutoDownloadTrigger() {
                     dummyBtn.style.display = 'none';
                     document.body.appendChild(dummyBtn);
 
-                    // Start Download
-                    // Pass null for preOpenedHandle and true for forceMemory to bypass user gesture requirement
-                    await downloadSegments(videoData.source, dummyBtn, videoData.duration, 0, -1, null, true);
-                    
-                    statusDiv.innerHTML = '<strong>✅ Auto-DL Started!</strong><br>Using Memory Mode (No interaction required).<br>Modo Memoria activo.';
-                    setTimeout(() => statusDiv.remove(), 10000);
+                    // Start Download with pre-selected save handle (picked when Auto-DL was enabled)
+                    const preOpenedHandle = await getHandleFromDB();
+                    if (!preOpenedHandle) {
+                        throw new Error('Missing preselected save file. Re-enable Auto-DL and choose a destination file.');
+                    }
+
+                    await downloadSegments(videoData.source, dummyBtn, videoData.duration, 0, -1, preOpenedHandle, false, videoId);
+
+                    statusDiv.innerHTML = '<strong>✅ Auto-DL finished!</strong><br>Latest VOD downloaded at max quality.<br>Último VOD descargado en máxima calidad.';
+                    setTimeout(() => statusDiv.remove(), 8000);
                 } else {
                     throw new Error('Video source not found');
                 }
@@ -2002,12 +2736,13 @@ async function checkAutoDownloadTrigger() {
             statusDiv.innerHTML = `<strong>❌ Auto-DL Error</strong><br>${e.message}`;
             statusDiv.style.color = '#ff4444';
             statusDiv.style.borderColor = '#ff4444';
+            clearAutoDLPersistence();
         }
     }
 }
 
 // Initialize check
-checkAutoDownloadTrigger();
+checkPendingAutoDownloadTrigger();
 
 // Protection against accidental navigation/host redirects
 function handleStreamerModeExit(e) {
@@ -2108,7 +2843,12 @@ function injectStreamerModeUI() {
                 }
             }
         }
-    } 
+
+        // Dashboard should only keep the VOD shortcut button; Auto-DL toggle removed here.
+        const existingContainer = document.getElementById('kvd-streamer-container');
+        if (existingContainer) existingContainer.remove();
+        return;
+    }
     // Strategy 2: Channel Page Injection (Search Bar)
     else {
         // Find Target: Search Bar Container (Top Nav)
@@ -2146,25 +2886,40 @@ function injectStreamerModeUI() {
          container.style.cssText = 'display: none; align-items: center; margin-left: 15px; margin-right: 15px; gap: 8px; z-index: 50;';
     }
     
-    // Toggle Switch
-    const toggle = document.createElement('div');
-    toggle.id = 'kvd-streamer-toggle';
-    toggle.title = 'Auto-download latest VOD when stream ends (Reloads page)';
-    toggle.style.cssText = 'width: 44px; height: 24px; background: #1a1a1a; border-radius: 12px; position: relative; cursor: pointer; border: 2px solid #555; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
-    
-    const knob = document.createElement('div');
-    knob.id = 'kvd-streamer-knob';
-    knob.style.cssText = 'width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: all 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);';
-    
-    toggle.appendChild(knob);
-    
-    // Label
-    const label = document.createElement('span');
-    label.textContent = 'Auto-DL';
-    label.style.cssText = 'font-size: 13px; font-weight: 700; color: #ccc; user-select: none;';
-    
-    container.appendChild(toggle);
-    container.appendChild(label);
+    let toggle = null;
+    let knob = null;
+    let label = null;
+
+    if (window.location.hostname === 'dashboard.kick.com') {
+        const button = document.createElement('button');
+        button.id = 'kvd-streamer-toggle';
+        button.type = 'button';
+        button.title = 'Auto-download latest VOD when stream ends';
+        button.textContent = 'Auto-DL';
+        button.style.cssText = 'background: #1a1a1a; color: #ccc; border: 2px solid #555; border-radius: 999px; padding: 6px 14px; font-weight: 700; cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+        container.appendChild(button);
+        toggle = button;
+    } else {
+        // Toggle Switch
+        toggle = document.createElement('div');
+        toggle.id = 'kvd-streamer-toggle';
+        toggle.title = 'Auto-download latest VOD when stream ends (Reloads page)';
+        toggle.style.cssText = 'width: 44px; height: 24px; background: #1a1a1a; border-radius: 12px; position: relative; cursor: pointer; border: 2px solid #555; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+        
+        knob = document.createElement('div');
+        knob.id = 'kvd-streamer-knob';
+        knob.style.cssText = 'width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: all 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);';
+        
+        toggle.appendChild(knob);
+        
+        // Label
+        label = document.createElement('span');
+        label.textContent = 'Auto-DL';
+        label.style.cssText = 'font-size: 13px; font-weight: 700; color: #ccc; user-select: none;';
+        
+        container.appendChild(toggle);
+        container.appendChild(label);
+    }
     
     // Insert based on position strategy
     if (insertPosition === 'before') {
@@ -2180,56 +2935,136 @@ function injectStreamerModeUI() {
     }
     
     // Event
-    const enableAutoDL = () => {
+    const getSuggestedAutoDLFileName = () => {
+        const slug = getChannelSlug() || 'channel';
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        return `kick-vod-auto-${slug}-${timestamp}.mp4`;
+    };
+
+    const promptForAutoDLHandle = async () => {
+        if (!window.showSaveFilePicker) {
+            alert('Your browser does not support file pre-selection for Auto-DL. / Tu navegador no soporta preselección de archivo para Auto-DL.');
+            return null;
+        }
+
+        try {
+            return await window.showSaveFilePicker({
+                suggestedName: getSuggestedAutoDLFileName(),
+                types: [{
+                    description: 'MP4 Video',
+                    accept: { 'video/mp4': ['.mp4'] }
+                }]
+            });
+        } catch (pickerError) {
+            console.log('[Streamer Mode] Save picker cancelled:', pickerError);
+            return null;
+        }
+    };
+
+    const enableAutoDL = async (saveHandle, liveMode = false) => {
+        if (!saveHandle) {
+            alert('Auto-DL needs a destination file selected first. / Auto-DL necesita un archivo destino primero.');
+            return false;
+        }
+
+        await saveHandleToDB(saveHandle);
+
         isStreamerModeEnabled = true;
+        localStorage.setItem(AUTO_DL_ENABLED_KEY, 'true');
         preventTabInactivity(); // Prevent tab sleep
-        
+
         // Enable Host Protection (Standard)
         window.addEventListener('beforeunload', handleStreamerModeExit);
-        
+
         // Enable Host Protection (SPA - History API Patch)
         document.body.setAttribute('data-kvd-auto-dl', 'true');
-        
+
         toggle.style.background = 'rgba(83, 252, 24, 0.2)';
         toggle.style.borderColor = '#53fc18';
         toggle.style.boxShadow = '0 0 10px rgba(83, 252, 24, 0.4)';
         toggle.classList.add('kvd-pulse-active');
-        
-        knob.style.transform = 'translateX(20px)';
-        knob.style.background = '#53fc18';
-        label.style.color = '#53fc18';
-        
+
+        if (knob) {
+            knob.style.transform = 'translateX(20px)';
+            knob.style.background = '#53fc18';
+        }
+        if (label) {
+            label.style.color = '#53fc18';
+        }
+
         streamEndDetected = false;
+        autoDlLiveModeEnabled = !!liveMode;
+
+        if (autoDlLiveModeEnabled) {
+            const slug = getChannelSlug();
+            if (!slug) {
+                alert('Could not determine channel slug for live capture. / No se pudo determinar el canal para captura en vivo.');
+                autoDlLiveModeEnabled = false;
+                return false;
+            }
+            startLiveAutoDlCapture(slug, saveHandle);
+            sendNotification('🚀 Live Auto-DL active', 'Downloading current VOD progress in realtime.');
+        }
+
+        return true;
     };
 
-    const disableAutoDL = () => {
+    const disableAutoDL = async () => {
         isStreamerModeEnabled = false;
         allowTabInactivity();
-        
+        clearAutoDLPersistence();
+
         // Disable Host Protection
         window.removeEventListener('beforeunload', handleStreamerModeExit);
         document.body.removeAttribute('data-kvd-auto-dl');
-        
+
+        const statusDiv = document.getElementById('kvd-auto-dl-status');
+        if (statusDiv) statusDiv.remove();
+
         toggle.style.background = '#1a1a1a';
         toggle.style.borderColor = '#555';
         toggle.style.boxShadow = 'none';
         toggle.classList.remove('kvd-pulse-active');
-        
-        knob.style.transform = 'translateX(0)';
-        knob.style.background = '#fff';
-        label.style.color = '#ccc';
-        
+
+        if (knob) {
+            knob.style.transform = 'translateX(0)';
+            knob.style.background = '#fff';
+        }
+        if (label) {
+            label.style.color = '#ccc';
+        }
+
         streamEndDetected = false;
+        autoDlLiveModeEnabled = false;
+        await stopLiveAutoDlCapture('manual');
+        clearHandleFromDB();
     };
 
-    toggle.onclick = () => {
+    const activateAutoDLOnChannelPage = async ({ skipConfirm = false } = {}) => {
+        if (!skipConfirm) {
+            const accepted = confirm('⚠️ ENABLE AUTO-DOWNLOAD?\n\n• When "Offline" is detected, the page will RELOAD IMMEDIATELY.\n• The system will wait 2 MINUTES for VOD generation.\n• Then it will automatically download the latest VOD.\n• Host/Redirect Protection will be ACTIVE.\n• You will choose the destination file NOW so no prompt appears later.\n\n¿ACTIVAR AUTO-DESCARGA?\n• Al detectar "Offline", la página se RECARGARÁ INMEDIATAMENTE.\n• El sistema esperará 2 MINUTOS para la generación del VOD.\n• Luego descargará automáticamente el último VOD.\n• Protección contra Host/Redirección estará ACTIVA.\n• Elegirás el archivo destino AHORA para evitar prompts luego.');
+            if (!accepted) return;
+        }
+
+        const handle = await promptForAutoDLHandle();
+        if (!handle) {
+            if (skipConfirm) clearAutoDLPersistence();
+            return;
+        }
+
+        const enableLiveMode = confirm('⚡ LIVE AUTO-DL?\n\nStart downloading the current VOD progress now (without overlay) and keep appending in real time until stream ends?\n\n¿AUTO-DL EN VIVO?\n\n¿Comenzar a descargar ahora todo lo generado del VOD (sin overlay) y seguir en tiempo real hasta que termine el stream?');
+        await enableAutoDL(handle, enableLiveMode);
+    };
+
+    toggle.onclick = async () => {
         if (!isStreamerModeEnabled) {
             // Check if we are on Dashboard
             if (window.location.hostname === 'dashboard.kick.com') {
                 const slug = getChannelSlug();
                 if (slug) {
                     if (confirm('⚠️ ACTIVATE & REDIRECT?\n\nEnable Auto-DL and go to channel page?\nActivar Auto-DL e ir al canal?')) {
-                        localStorage.setItem('kvd_auto_dl_carry_over', 'true');
+                        localStorage.setItem(AUTO_DL_CARRY_OVER_KEY, 'true');
+                        localStorage.setItem(AUTO_DL_ENABLED_KEY, 'true');
                         window.location.href = `https://kick.com/${slug}`;
                     }
                 } else {
@@ -2239,35 +3074,41 @@ function injectStreamerModeUI() {
             }
 
             // Normal Channel Page Activation
-            if (confirm('⚠️ ENABLE AUTO-DOWNLOAD?\n\n• When "Offline" is detected, the page will RELOAD IMMEDIATELY.\n• The system will wait 2 MINUTES for VOD generation.\n• Then it will automatically download the latest VOD.\n• Host/Redirect Protection will be ACTIVE.\n\n¿ACTIVAR AUTO-DESCARGA?\n• Al detectar "Offline", la página se RECARGARÁ INMEDIATAMENTE.\n• El sistema esperará 2 MINUTOS para la generación del VOD.\n• Luego descargará automáticamente el último VOD.\n• Protección contra Host/Redirección estará ACTIVA.')) {
-                enableAutoDL();
-            }
+            await activateAutoDLOnChannelPage();
         } else {
-            disableAutoDL();
+            await disableAutoDL();
         }
     };
 
     // Check for Carry-Over State (Redirected from Dashboard)
-    if (localStorage.getItem('kvd_auto_dl_carry_over') === 'true') {
-        localStorage.removeItem('kvd_auto_dl_carry_over');
-        // Activate immediately without confirm
-        enableAutoDL();
+    if (localStorage.getItem(AUTO_DL_CARRY_OVER_KEY) === 'true') {
+        localStorage.removeItem(AUTO_DL_CARRY_OVER_KEY);
+        // Activate on channel page flow (asks destination file picker directly)
+        activateAutoDLOnChannelPage({ skipConfirm: true });
         console.log('[Streamer Mode] Auto-DL enabled via Dashboard redirect.');
     }
 }
 
 function isOfflineVisible() {
-    const offlineBadge = document.querySelector('.bg-surfaceInverse-base');
-    if (offlineBadge && (offlineBadge.textContent.includes('Desconectado') || offlineBadge.textContent.includes('Offline'))) {
-        return true;
-    }
-    const h2s = document.querySelectorAll('h2');
-    for (const h of h2s) {
-        if (h.textContent.includes('está fuera de línea') || h.textContent.includes('is offline')) {
-            return true;
-        }
-    }
-    return false;
+    const structuredOfflinePanel = Array.from(document.querySelectorAll('div.z-player')).find((el) => {
+        const badge = el.querySelector('.bg-surfaceInverse-base');
+        const headline = el.querySelector('h2');
+        if (!badge || !headline) return false;
+
+        // Language-agnostic: rely on the panel structure/classnames instead of text content
+        const hasLayout = el.classList.contains('absolute')
+            && el.classList.contains('bg-surface-base');
+        const badgeLooksLikeStatus = badge.classList.contains('uppercase')
+            && badge.classList.contains('text-sm');
+
+        return hasLayout && badgeLooksLikeStatus;
+    });
+
+    if (structuredOfflinePanel) return true;
+
+    // Fallback (still language-agnostic): known status badge class rendered while stream is offline
+    const offlineBadge = document.querySelector('div.z-player .bg-surfaceInverse-base.text-surfaceInverse-onInverse');
+    return !!offlineBadge;
 }
 
 function checkStreamStatus() {
@@ -2275,16 +3116,28 @@ function checkStreamStatus() {
 
     if (isOfflineVisible()) {
         streamEndDetected = true;
+
+        if (autoDlLiveModeEnabled) {
+            console.log('[Streamer Mode] Stream offline detected. Finalizing live Auto-DL file...');
+            autoDlLiveModeEnabled = false;
+            stopLiveAutoDlCapture('offline');
+            isStreamerModeEnabled = false;
+            allowTabInactivity();
+            clearAutoDLPersistence();
+            clearHandleFromDB();
+            return;
+        }
+
         console.log('[Streamer Mode] Stream went offline. Triggering Reload & Auto-DL...');
-        
+
         // Hide UI immediately
         const container = document.getElementById('kvd-streamer-container');
         if (container) container.style.display = 'none';
-        
+
         // Set Persistence Flags
-        localStorage.setItem('kvd_auto_dl_pending', 'true');
+        localStorage.setItem(AUTO_DL_PENDING_KEY, 'true');
         const slug = getChannelSlug();
-        if (slug) localStorage.setItem('kvd_channel_slug', slug);
+        if (slug) localStorage.setItem(AUTO_DL_CHANNEL_KEY, slug);
 
         // Reload Page
         window.location.reload();
@@ -2471,7 +3324,7 @@ function injectButton() {
 }
 
 // Check if we need to auto-trigger download from thumbnail click
-function checkAutoDownloadTrigger() {
+function checkThumbnailAutoDownloadTrigger() {
     const autoDl = sessionStorage.getItem('kvd_auto_download');
     if (!autoDl) return;
 
@@ -2507,7 +3360,7 @@ setInterval(() => {
     }
 
     // Check for auto-download trigger from thumbnail (Every 1s - Critical)
-    checkAutoDownloadTrigger();
+    checkThumbnailAutoDownloadTrigger();
 
     // Navigation detection (Every 1s - Critical)
     if (currentDownloadVideoId && currentId && currentId !== currentDownloadVideoId) {
@@ -2541,6 +3394,12 @@ setInterval(() => {
                 if (isStreamerModeEnabled && !streamEndDetected) {
                     isStreamerModeEnabled = false;
                     allowTabInactivity();
+                    clearAutoDLPersistence();
+                    autoDlLiveModeEnabled = false;
+                    stopLiveAutoDlCapture('manual');
+                    clearHandleFromDB();
+                    const statusDiv = document.getElementById('kvd-auto-dl-status');
+                    if (statusDiv) statusDiv.remove();
                     const toggle = document.getElementById('kvd-streamer-toggle');
                     if (toggle) {
                         toggle.classList.remove('kvd-pulse-active');
@@ -2561,6 +3420,9 @@ setInterval(() => {
     }
     
     checkStreamStatus();
+    if (globalCheckCycle % 2 === 0) {
+        attemptRejectHost();
+    }
     // -------------------------------------------
     
     // Inject thumbnail buttons periodically (Every 5 seconds - Low Priority)
@@ -2643,6 +3505,71 @@ function sendChatMessage(message) {
 }
 
 // --- Easter Eggs (Roadmap #28 & #29) & Custom Commands ---
+
+function parseBooleanSetting(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value !== 'string') return null;
+
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'enabled', 'exact'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off', 'disabled', 'partial', 'contains'].includes(normalized)) return false;
+    return null;
+}
+
+function getExactMatchSetting() {
+    const directKeys = [
+        'kvd_easter_egg_exact_match',
+        'kvd_easter_eggs_exact_match',
+        'kvd_tricks_exact_match',
+        'kvd_chat_exact_match',
+        'kvd_exact_match'
+    ];
+
+    for (const key of directKeys) {
+        const parsed = parseBooleanSetting(localStorage.getItem(key));
+        if (parsed !== null) return parsed;
+    }
+
+    const objectKeys = [
+        'kvd_settings',
+        'kvd_chat_settings',
+        'kvd_easter_egg_settings',
+        'kvd_tricks_settings'
+    ];
+
+    const nestedPaths = [
+        ['exactMatch'],
+        ['easterEggExactMatch'],
+        ['tricksExactMatch'],
+        ['chatExactMatch'],
+        ['easterEggs', 'exactMatch'],
+        ['tricks', 'exactMatch']
+    ];
+
+    for (const key of objectKeys) {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        try {
+            const obj = JSON.parse(raw);
+            for (const path of nestedPaths) {
+                let current = obj;
+                for (const segment of path) {
+                    current = current && current[segment];
+                }
+                const parsed = parseBooleanSetting(current);
+                if (parsed !== null) return parsed;
+            }
+        } catch (_) {}
+    }
+
+    return false;
+}
+
+function triggerMatches(cleanText, expectedText, exactMatchEnabled) {
+    return exactMatchEnabled ? cleanText === expectedText : cleanText.includes(expectedText);
+}
+
 function injectEasterEggs() {
     // Selector based on Roadmap line 30 & 41
     const chatInput = document.querySelector('div[data-testid="chat-input"][contenteditable="true"], div[data-input="true"][contenteditable="true"].editor-input');
@@ -2677,44 +3604,45 @@ function injectEasterEggs() {
             }
 
             // --- Easter Eggs ---
+            const exactMatchEnabled = getExactMatchSetting();
 
             // Roadmap #28: "Imaginate un cubo"
-            if (cleanText.includes('imaginate un cubo')) {
+            if (triggerMatches(cleanText, 'imaginate un cubo', exactMatchEnabled)) {
                 clearChat();
                 triggerCubeEasterEgg();
                 return; 
             }
 
             // "Contexto: No te imaginaste un cubo"
-            if (cleanText.includes('contexto: no te imaginaste un cubo')) {
+            if (triggerMatches(cleanText, 'contexto: no te imaginaste un cubo', exactMatchEnabled)) {
                 clearChat();
                 triggerCubeContextEasterEgg();
                 return;
             }
 
             // "Aguante Pavle"
-            if (cleanText.includes('aguante pavle')) {
+            if (triggerMatches(cleanText, 'aguante pavle', exactMatchEnabled)) {
                 clearChat();
                 triggerPavleEasterEgg();
                 return;
             }
 
             // "Mondongo"
-            if (cleanText.includes('mondongo')) {
+            if (triggerMatches(cleanText, 'mondongo', exactMatchEnabled)) {
                 clearChat();
                 triggerMondongoEasterEgg();
                 return;
             }
 
             // "Mambo"
-            if (cleanText.includes('mambo')) {
+            if (triggerMatches(cleanText, 'mambo', exactMatchEnabled)) {
                 clearChat();
                 triggerMamboEasterEgg();
                 return;
             }
 
             // "Una maroma!" (Barrel Roll)
-            if (cleanText.includes('una maroma!')) {
+            if (triggerMatches(cleanText, 'una maroma!', exactMatchEnabled)) {
                 clearChat();
                 document.body.classList.add('kvd-barrel-roll');
                 setTimeout(() => document.body.classList.remove('kvd-barrel-roll'), 1000);
@@ -2722,7 +3650,7 @@ function injectEasterEggs() {
             }
 
             // "me derrito lpm" (Melt)
-            if (cleanText.includes('me derrito lpm')) {
+            if (triggerMatches(cleanText, 'me derrito lpm', exactMatchEnabled)) {
                 clearChat();
                 document.body.classList.add('kvd-melt-effect');
                 // Wait for animation (4s) + a brief "empty" moment (1s)
@@ -2737,7 +3665,7 @@ function injectEasterEggs() {
             ];
             
             // Enable Admin Mode (Per Channel)
-            if (enableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (enableAdminTricks.some(trick => triggerMatches(cleanText, trick, exactMatchEnabled))) {
                 const slug = getChannelSlug();
                 if (!slug) return;
 
@@ -2769,7 +3697,7 @@ function injectEasterEggs() {
                 "ser admin me da ansiedad."
             ];
 
-            if (disableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (disableAdminTricks.some(trick => triggerMatches(cleanText, trick, exactMatchEnabled))) {
                 localStorage.removeItem('kvd_admin_channels');
                 localStorage.removeItem('kvd_admin_trick_enabled'); // Ensure global is gone too
                 
