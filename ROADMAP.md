@@ -4,6 +4,12 @@ EL AGENTE NO DEBE EDITAR ESTE ARCHIVO, SÓLO LEERLO. EL USUARIO LO EDITARÁ CUAN
 
 Este archivo rastrea las características planificadas, mejoras y problemas conocidos a abordar en futuras versiones de Kick VOD Downloader.
 
+## 🔐 Seguridad y Calidad (Sugerencias)
+- [x] **Validar origen de mensajes internos**: Verificar `sender.id` en `chrome.runtime.onMessage` y descartar mensajes no provenientes de la extensión para minimizar superficies de ataque entre extensiones.
+- [x] **Limitar longitud de mensajes de chat**: Evitar cargas excesivas o bloqueos de UI al enviar mensajes largos desde la biblioteca.
+- [x] **Auditar URLs de streaming**: Añadir validación de esquema/host para evitar que playlists maliciosas inyecten URLs inesperadas (defensa en profundidad).
+- [x] **Límites de concurrencia y backoff global**: Unificar reintentos y límites de descarga para minimizar abuso accidental y reducir carga en el navegador.
+
 ## 🔮 Próxima versión v2.1.0 (Cuando se termina de trabajar en la lista de funciones y arreglo de bugs se debe subir de versión en los manifest)
 
 ### 🐛 Correcciones y Mejoras
@@ -41,12 +47,12 @@ Este archivo rastrea las características planificadas, mejoras y problemas cono
 Código del campo de texto del chat del panel de moderación: <div data-input="true" enterkeyhint="send" class="editor-input" contenteditable="true" data-testid="chat-input" role="textbox" spellcheck="true" data-lexical-editor="true" style="outline: none; user-select: text; white-space: pre-wrap; word-break: break-word;"><p class="editor-paragraph"><br></p></div>
 - [x] **Notificaciones de Escritorio**: Implementar notificaciones nativas del navegador para avisar cuando una descarga finaliza o falla, útil si el usuario está en otra pestaña o aplicación. (Sólamente si el usuario NO está en la pestaña)
 - [x] **Selector de Calidad**: Añadir un selector en la interfaz para permitir a los usuarios elegir entre diferentes calidades de video disponibles para descargar. Esto podría mejorar la experiencia del usuario al adaptarse a sus necesidades y conexiones de red.
-- [PENDIENTE] **Protección contra Hosts**: Cuando el Auto-DL esté activo, la extensión buscará cada 2 segundos el botón de rechazar host y lo clickeará automáticamente. Esto evitará que el host bloquee la descarga automática por redirección. (código del botón sacado con la herramienta de "Inspeccionar" en la línea 45)
-(Estoy esperando a dar con un canal que esté por hostear a otro para sacar el código del botón)
+- [x] **Protección contra Hosts**: Cuando el Auto-DL esté activo, la extensión buscará cada 2 segundos el botón de rechazar host y lo clickeará automáticamente. Esto evitará que el host bloquee la descarga automática por redirección. (código del botón sacado con la herramienta de "Inspeccionar" en la línea 45)
 - [x] **Auto-Retry Mejorado**: Sistema más robusto de reintentos automáticos ante fallos de red temporales durante la descarga de chunks.
-- [ ] **Cambiar toggler de Auto-DL**: En el Dashboard del canal se debe cambiar el toggler a un botón que te redireccione al canal (desde https://dashboard.kick.com/moderator/CANAL a https://kick.com/CANAL) y active directamente el Auto-DL.
-- [ ] **
+- [x] **Cambiar toggler de Auto-DL**: En el Dashboard del canal se debe cambiar el toggler a un botón que te redireccione al canal (desde https://dashboard.kick.com/moderator/CANAL a https://kick.com/CANAL) y active directamente el Auto-DL.
 
 ---
 
 ### 💡 Ideas Propuestas (Pendientes de Evaluación)
+- [ ] **Panel de estado Auto-DL**: Añadir un panel pequeño con los últimos eventos (host rechazado, reconexiones, errores) para facilitar el diagnóstico.
+- [ ] **Limpieza manual**: Un botón en el popup para limpiar caché temporal/IDB si la descarga se interrumpe de forma inesperada.
