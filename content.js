@@ -2384,6 +2384,7 @@ function ensureLiveAutoDlInfoWindow() {
         <div id="kvd-live-auto-dl-size" style="margin-bottom:3px;">Size: 0 Bytes</div>
         <div id="kvd-live-auto-dl-speed" style="margin-bottom:3px;">Speed: 0 B/s</div>
         <div id="kvd-live-auto-dl-segments" style="opacity:.85;">Segments: 0 / 0</div>
+        <div id="kvd-live-auto-dl-status" style="margin-top:5px;color:#53fc18;opacity:.95;">Status: Starting...</div>
     `;
 
     const header = panel.querySelector('#kvd-live-auto-dl-header');
@@ -2417,7 +2418,7 @@ function ensureLiveAutoDlInfoWindow() {
     return panel;
 }
 
-function updateLiveAutoDlInfoWindow({ downloadedSegments = 0, visibleSegments = 0, bytes = 0, speed = 0 } = {}) {
+function updateLiveAutoDlInfoWindow({ downloadedSegments = 0, visibleSegments = 0, bytes = 0, speed = 0, status = 'Running...', statusColor = '#53fc18' } = {}) {
     const panel = ensureLiveAutoDlInfoWindow();
     const progressPct = visibleSegments > 0 ? Math.min(100, Math.round((downloadedSegments / visibleSegments) * 100)) : 0;
 
@@ -2425,11 +2426,16 @@ function updateLiveAutoDlInfoWindow({ downloadedSegments = 0, visibleSegments = 
     const sizeEl = panel.querySelector('#kvd-live-auto-dl-size');
     const speedEl = panel.querySelector('#kvd-live-auto-dl-speed');
     const segEl = panel.querySelector('#kvd-live-auto-dl-segments');
+    const statusEl = panel.querySelector('#kvd-live-auto-dl-status');
 
     if (progressEl) progressEl.textContent = `Progress: ${progressPct}%`;
     if (sizeEl) sizeEl.textContent = `Size: ${formatBytes(bytes)}`;
     if (speedEl) speedEl.textContent = `Speed: ${formatBytes(Math.max(0, speed))}/s`;
     if (segEl) segEl.textContent = `Segments: ${downloadedSegments} / ${visibleSegments}`;
+    if (statusEl) {
+        statusEl.textContent = `Status: ${status}`;
+        statusEl.style.color = statusColor;
+    }
 }
 
 function removeLiveAutoDlInfoWindow() {
@@ -2464,7 +2470,7 @@ async function startLiveAutoDlCapture(slug, handle) {
         maxVisibleSeq: 0
     };
     liveAutoDlState = state;
-    updateLiveAutoDlInfoWindow({ downloadedSegments: 0, visibleSegments: 0, bytes: 0, speed: 0 });
+    updateLiveAutoDlInfoWindow({ downloadedSegments: 0, visibleSegments: 0, bytes: 0, speed: 0, status: 'Initializing live capture...' });
 
     state.completionPromise = (async () => {
         let writable = null;
@@ -2473,7 +2479,29 @@ async function startLiveAutoDlCapture(slug, handle) {
         let initWritten = false;
 
         try {
-            let masterUrl = await fetchLiveSourceForChannel(slug);
+            let masterUrl = null;
+            for (let attempt = 1; attempt <= 12 && !state.stopRequested; attempt++) {
+                try {
+                    updateLiveAutoDlInfoWindow({
+                        downloadedSegments: state.downloadedSeq.size,
+                        visibleSegments: state.maxVisibleSeq,
+                        bytes: state.bytesDownloaded,
+                        speed: state.speedBytesPerSecond,
+                        status: `Waiting for live source... (${attempt}/12)`,
+                        statusColor: '#ffcf40'
+                    });
+                    masterUrl = await fetchLiveSourceForChannel(slug);
+                    break;
+                } catch (sourceError) {
+                    if (attempt >= 12) throw sourceError;
+                    await new Promise(r => setTimeout(r, 3000));
+                }
+            }
+
+            if (!masterUrl) {
+                throw new Error('Live source was not available in time.');
+            }
+
             let playlistUrl = masterUrl;
 
             const masterText = await (await fetch(masterUrl, { cache: 'no-store', credentials: 'include' })).text();
@@ -2515,7 +2543,8 @@ async function startLiveAutoDlCapture(slug, handle) {
                         downloadedSegments: state.downloadedSeq.size,
                         visibleSegments: state.maxVisibleSeq,
                         bytes: state.bytesDownloaded,
-                        speed: state.speedBytesPerSecond
+                        speed: state.speedBytesPerSecond,
+                        status: 'Downloading in realtime...'
                     });
                 });
             });
@@ -2531,7 +2560,8 @@ async function startLiveAutoDlCapture(slug, handle) {
                     downloadedSegments: state.downloadedSeq.size,
                     visibleSegments: state.maxVisibleSeq,
                     bytes: state.bytesDownloaded,
-                    speed: state.speedBytesPerSecond
+                    speed: state.speedBytesPerSecond,
+                    status: 'Monitoring live playlist...'
                 });
 
                 for (const seg of parsed.segments) {
@@ -2555,6 +2585,14 @@ async function startLiveAutoDlCapture(slug, handle) {
 
             if (transmuxer) transmuxer.flush();
             await writeQueue;
+            updateLiveAutoDlInfoWindow({
+                downloadedSegments: state.downloadedSeq.size,
+                visibleSegments: state.maxVisibleSeq,
+                bytes: state.bytesDownloaded,
+                speed: state.speedBytesPerSecond,
+                status: 'Finalized successfully',
+                statusColor: '#53fc18'
+            });
             await writable.close();
             currentWritable = null;
             currentFileHandle = null;
@@ -2565,11 +2603,29 @@ async function startLiveAutoDlCapture(slug, handle) {
             }
             currentWritable = null;
             currentFileHandle = null;
+
+            updateLiveAutoDlInfoWindow({
+                downloadedSegments: state.downloadedSeq.size,
+                visibleSegments: state.maxVisibleSeq,
+                bytes: state.bytesDownloaded,
+                speed: state.speedBytesPerSecond,
+                status: `Error: ${error?.message || 'Unexpected error'}`,
+                statusColor: '#ff5c5c'
+            });
+
+            isStreamerModeEnabled = false;
+            autoDlLiveModeEnabled = false;
+            allowTabInactivity();
+            clearAutoDLPersistence();
+            clearHandleFromDB();
+            resetAutoDlVisualState();
             sendNotification('❌ Live Auto-DL error', error?.message || 'Unexpected error');
         } finally {
             state.active = false;
             liveAutoDlState = null;
-            removeLiveAutoDlInfoWindow();
+            if (!autoDlLiveModeEnabled) {
+                setTimeout(() => removeLiveAutoDlInfoWindow(), 8000);
+            }
         }
     })();
 
@@ -2590,6 +2646,28 @@ function clearAutoDLPersistence() {
     localStorage.removeItem(AUTO_DL_CHANNEL_KEY);
     localStorage.removeItem(AUTO_DL_CARRY_OVER_KEY);
     localStorage.removeItem(AUTO_DL_ENABLED_KEY);
+}
+
+function resetAutoDlVisualState() {
+    document.body.removeAttribute('data-kvd-auto-dl');
+
+    const toggle = document.getElementById('kvd-streamer-toggle');
+    if (!toggle) return;
+
+    toggle.classList.remove('kvd-pulse-active');
+    toggle.style.background = '#1a1a1a';
+    toggle.style.borderColor = '#555';
+    toggle.style.boxShadow = 'none';
+
+    const knob = document.getElementById('kvd-streamer-knob');
+    if (knob) {
+        knob.style.transform = 'translateX(0)';
+        knob.style.background = '#fff';
+    }
+
+    const container = document.getElementById('kvd-streamer-container');
+    const label = container ? container.querySelector('span') : null;
+    if (label) label.style.color = '#ccc';
 }
 
 function findHostRejectButton() {
@@ -3125,6 +3203,7 @@ function checkStreamStatus() {
             allowTabInactivity();
             clearAutoDLPersistence();
             clearHandleFromDB();
+            resetAutoDlVisualState();
             return;
         }
 
