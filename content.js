@@ -2330,6 +2330,41 @@ function parseMediaPlaylist(playlistText, playlistUrl) {
     };
 }
 
+async function resolveBestMediaPlaylistUrl(streamUrl) {
+    const response = await fetch(streamUrl, getLiveFetchOptions(streamUrl));
+    if (!response.ok) throw new Error(`Playlist source fetch failed (${response.status})`);
+    const text = await response.text();
+
+    if (!text.includes('#EXT-X-STREAM-INF')) {
+        return streamUrl;
+    }
+
+    const variants = parseMasterVariants(text, streamUrl);
+    if (!variants.length) return streamUrl;
+    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+    return variants[0].url;
+}
+
+async function fetchCurrentVodSourceForLiveChannel(slug) {
+    try {
+        const response = await fetch(`https://kick.com/api/v1/channels/${slug}`, { credentials: 'include' });
+        if (!response.ok) return null;
+        const data = await response.json();
+        const liveVideoId = data?.livestream?.video?.uuid || data?.livestream?.video?.id;
+        if (!liveVideoId) return null;
+
+        const videoData = await fetchVideoData(liveVideoId);
+        if (!videoData || !videoData.source) return null;
+
+        return {
+            source: videoData.source,
+            duration: Number(videoData.duration || 0)
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
 async function fetchLiveSourceForChannel(slug) {
     const response = await fetch(`https://kick.com/api/v1/channels/${slug}`, { credentials: 'include' });
     if (!response.ok) throw new Error(`Channel API failed (${response.status})`);
@@ -2477,6 +2512,7 @@ async function startLiveAutoDlCapture(slug, handle) {
         active: true,
         stopRequested: false,
         downloadedSeq: new Set(),
+        downloadedUrls: new Set(),
         completionPromise: null,
         bytesDownloaded: 0,
         speedBytesPerSecond: 0,
@@ -2517,16 +2553,7 @@ async function startLiveAutoDlCapture(slug, handle) {
                 throw new Error('Live source was not available in time.');
             }
 
-            let playlistUrl = masterUrl;
-
-            const masterText = await (await fetch(masterUrl, getLiveFetchOptions(masterUrl))).text();
-            if (masterText.includes('#EXT-X-STREAM-INF')) {
-                const variants = parseMasterVariants(masterText, masterUrl);
-                if (variants.length) {
-                    variants.sort((a, b) => b.bandwidth - a.bandwidth);
-                    playlistUrl = variants[0].url;
-                }
-            }
+            let playlistUrl = await resolveBestMediaPlaylistUrl(masterUrl);
 
             writable = await handle.createWritable();
             currentFileHandle = handle;
@@ -2564,6 +2591,45 @@ async function startLiveAutoDlCapture(slug, handle) {
                 });
             });
 
+            // Backfill phase: try to download from the earliest available VOD timeline first.
+            const liveVodSource = await fetchCurrentVodSourceForLiveChannel(slug);
+            if (liveVodSource?.source) {
+                try {
+                    const backfillPlaylistUrl = await resolveBestMediaPlaylistUrl(liveVodSource.source);
+                    const backfillRes = await fetch(backfillPlaylistUrl, getLiveFetchOptions(backfillPlaylistUrl));
+                    if (backfillRes.ok) {
+                        const backfillText = await backfillRes.text();
+                        const backfillParsed = parseMediaPlaylist(backfillText, backfillPlaylistUrl);
+                        state.maxVisibleSeq = Math.max(state.maxVisibleSeq, backfillParsed.segments.length);
+
+                        updateLiveAutoDlInfoWindow({
+                            downloadedSegments: state.downloadedSeq.size,
+                            visibleSegments: state.maxVisibleSeq,
+                            bytes: state.bytesDownloaded,
+                            speed: state.speedBytesPerSecond,
+                            status: 'Backfilling from stream start (earliest available)...',
+                            statusColor: '#ffcf40'
+                        });
+
+                        for (const seg of backfillParsed.segments) {
+                            if (state.stopRequested || !isStreamerModeEnabled || !autoDlLiveModeEnabled) break;
+                            if (state.downloadedSeq.has(seg.seq) || state.downloadedUrls.has(seg.url)) continue;
+
+                            const segRes = await fetch(seg.url, getLiveFetchOptions(seg.url));
+                            if (!segRes.ok) continue;
+                            const bytes = new Uint8Array(await segRes.arrayBuffer());
+                            transmuxer.push(bytes);
+                            transmuxer.flush();
+                            state.downloadedSeq.add(seg.seq);
+                            state.downloadedUrls.add(seg.url);
+                        }
+                        await writeQueue;
+                    }
+                } catch (backfillError) {
+                    console.warn('[Live Auto-DL] Backfill attempt failed, continuing realtime mode:', backfillError);
+                }
+            }
+
             while (!state.stopRequested && isStreamerModeEnabled && autoDlLiveModeEnabled) {
                 const playlistRes = await fetch(playlistUrl, getLiveFetchOptions(playlistUrl));
                 if (!playlistRes.ok) throw new Error(`Playlist fetch failed (${playlistRes.status})`);
@@ -2576,12 +2642,12 @@ async function startLiveAutoDlCapture(slug, handle) {
                     visibleSegments: state.maxVisibleSeq,
                     bytes: state.bytesDownloaded,
                     speed: state.speedBytesPerSecond,
-                    status: 'Monitoring live playlist...'
+                    status: 'Monitoring live playlist (realtime append)...'
                 });
 
                 for (const seg of parsed.segments) {
                     if (state.stopRequested) break;
-                    if (state.downloadedSeq.has(seg.seq)) continue;
+                    if (state.downloadedSeq.has(seg.seq) || state.downloadedUrls.has(seg.url)) continue;
 
                     const segRes = await fetch(seg.url, getLiveFetchOptions(seg.url));
                     if (!segRes.ok) continue;
@@ -2589,6 +2655,7 @@ async function startLiveAutoDlCapture(slug, handle) {
                     transmuxer.push(bytes);
                     transmuxer.flush();
                     state.downloadedSeq.add(seg.seq);
+                    state.downloadedUrls.add(seg.url);
                 }
 
                 await writeQueue;
