@@ -1,128 +1,60 @@
-# Release Notes
+# Release Notes - Kick VOD Downloader v2.0.0
 
-## v1.4.1 (Ready)
-2026-01-31
+¡Bienvenidos a la versión 2.0.0! Esta actualización trae grandes novedades, especialmente diseñadas para moderadores y creadores de contenido, además de importantes correcciones y optimizaciones.
 
-### Features & Improvements 🚀
-- **Download Speed Indicator**: Added real-time download speed (MB/s) display in the download overlay.
-- **Auto-Reload**: Implemented automatic page reload (with 4s delay) after download completion to ensure memory cleanup and prevent state issues.
-- **Security Hardening**: Replaced all instances of `innerHTML` with safe DOM manipulation methods to comply with strict Firefox Add-on Store policies.
+## ✅ Funciones actuales (resumen amigable)
 
-### Bug Fixes 🐛
-- **File Persistence**: Fixed a critical issue where reloading the page or closing the tab would inadvertently delete the successfully downloaded file. Now, file deletion only occurs if a download is cancelled or interrupted.
-- **Manifest Compatibility**: Updated `strict_min_version` to 140.0 in Firefox manifest to resolve `data_collection_permissions` compatibility warnings.
+- **Descarga MP4 en un clic** desde la página del VOD.
+- **Selector de calidad** antes de descargar.
+- **Modo solo audio (M4A)** para ahorrar espacio.
+- **Descarga recortada** eligiendo inicio y fin.
+- **Progreso claro** con porcentaje, tamaño y tiempo restante.
+- **Progreso global** en el ícono de la extensión y el título de la pestaña.
+- **Auto‑silenciado** durante la descarga y restauración automática.
+- **Limpieza automática** si cancelas o cambias de video.
+- **Botones en miniaturas** para descargar VODs rápidamente.
+- **Auto‑DL para moderadores**: detecta fin del stream y descarga solo.
+- **Protección contra host/raids** para no perder la descarga.
+- **Auto‑retry** ante fallos de red en descargas largas.
+- **Notificaciones de escritorio** cuando termina o falla.
+- **Prevención de suspensión** de la pestaña mientras descarga o espera.
+- **Biblioteca de comandos** en el popup para enviar mensajes rápido.
+- **Amplifier** para subir la ganancia de audio (+0 a +48 dB).
+- **Animaciones al seguir/dejar de seguir** en la web.
 
----
+## 🚀 Nuevas Funcionalidades
 
-## v1.4.1 (Listo) - Español 🇪🇸
-2026-01-31
+### Modo Moderador & Descarga Automática
+- **Descarga Automática al Finalizar Stream**: Si eres moderador del canal, ahora verás un nuevo interruptor (toggle) en la interfaz. Al activarlo, la extensión detectará automáticamente cuando el stream finalice y comenzará a descargar el último VOD disponible.
+- **Detección Inteligente**: El sistema identifica el estado "Desconectado" del canal, espera 2 minutos para que se genere el VOD y gestiona la descarga de forma autónoma.
+- **Protección contra Host/Raids**: Se han implementado medidas para evitar que la descarga se confunda si el streamer aloja otro canal al terminar cuando la descarga automática está activa.
 
-### Mejoras y Características 🚀
-- **Indicador de Velocidad**: Añadida visualización de la velocidad de descarga en tiempo real (MB/s) en el overlay.
-- **Auto-Recarga**: Implementada recarga automática de página (con 4s de retraso) tras finalizar la descarga para asegurar limpieza de memoria y evitar errores de estado.
-- **Seguridad**: Reemplazadas todas las instancias de `innerHTML` por métodos seguros de manipulación del DOM para cumplir con las políticas estrictas de la tienda de Firefox.
+### Biblioteca de Comandos para Moderadores
+- **Gestión de Comandos y Mensajes**: Nueva herramienta accesible desde el icono de la extensión.
+- **Alcance Global y por Canal**: Puedes guardar comandos que uses en todos lados (Global) o mensajes específicos para un canal en particular.
+- **Envío Rápido**: Envía tus comandos guardados al chat con un solo clic, sin necesidad de escribirlos repetidamente.
 
-### Correcciones 🐛
-- **Persistencia de Archivos**: Corregido un error crítico donde recargar la página o cerrar la pestaña eliminaba el archivo descargado aunque la descarga hubiera sido exitosa. Ahora el borrado solo ocurre si se interrumpe la descarga.
-- **Compatibilidad de Manifiesto**: Actualizada `strict_min_version` a 140.0 en el manifiesto de Firefox para resolver advertencias de compatibilidad con `data_collection_permissions`.
+### Mejoras en la Interfaz de Usuario
+- **Selector de Calidad de Video**: Ahora puedes elegir la calidad del video antes de descargar (1080p, 720p, 480p, 360p, 160p). Por defecto seleccionará siempre la "Mejor" calidad disponible.
+- **Modo Solo Audio (M4A)**: Nueva opción experimental para descargar el audio del VOD. Extrae la pista de audio (AAC) del video de 360p y la guarda como un archivo `.m4a` puro, eliminando la pista de video para ahorrar espacio. Ideal para podcasts o edición.
+- **Botones de Descarga en Miniaturas**: Ahora puedes iniciar descargas (Completas o Recortadas) directamente desde las miniaturas de los videos en la sección de VODs, te ahorras un click...
+- **Simplificación Visual**: El botón de descarga ahora muestra simplemente "Download" y es ligeramente más grande para facilitar su uso.
+- **Apoyo al Desarrollador**: Añadido un botón de "Donate" en el menú de la extensión.
 
----
+## 🛠 Mejoras y Optimizaciones
 
-## v1.4 (Ready)
-2026-01-31
+- **Prevención de Inactividad**: La extensión ahora evita que la pestaña del navegador entre en modo de suspensión (sleep) mientras hay una descarga activa o el modo de descarga automática está esperando. Esto asegura que las descargas largas no se interrumpan si cambias de pestaña.
+- **Limpieza Automática**: Si cancelas una descarga, la página se recargará automáticamente para limpiar la memoria y asegurar que no queden procesos residuales.
+- **Optimización de Archivos MP4**: Mejorada la compatibilidad de los archivos generados con reproductores y editores de video.
 
-### New Features 🚀
-- **Download Options Modal**: Before downloading, you can now choose to download the full VOD or trim a specific part.
-- **Video Trimming UI**: A visual interface allows you to select the Start and End times (HH:MM:SS) for your download.
-- **Firefox Compatibility**: Fixed critical issues on Firefox, including "Permission denied" errors, 0KB files, and download hangs.
-- **Fixed Segment Filtering**: Resolved a critical bug where empty lines in the playlist caused Brave/Chrome to download the full VOD instead of the trimmed clip, or produce broken files.
-- **Duration Warning**: Added a helpful disclaimer in the overlay about potential duration discrepancies (up to 2 minutes) due to platform limitations.
+## 🐛 Correcciones de Errores
 
-### Improvements & Fixes 🛠️
-- **Stability**: Removed auto-reload behavior that interrupted downloads on some browsers.
-- **Performance**: Fixed IndexedDB race conditions and memory management.
-- **UI**: Added a fade-in animation for the modal and improved overlay styling.
+- **Visualización de Bitrate en Windows**: Solucionado un problema técnico donde el Explorador de Archivos de Windows mostraba un bitrate incorrecto (ej. 19kbps). Ahora se inyectan los metadatos correctos (átomo `btrt`) para que Windows reporte la calidad real del video.
+- **Rendimiento de Auto-DL**: Optimizada la supervisión del stream para reducir drásticamente el uso de CPU y memoria. Se ha eliminado el problema de "congelamiento" del stream tras largas sesiones de uso, asegurando una experiencia fluida incluso después de horas.
+- **Auto-DL en Dashboard**: Corregido el comportamiento del interruptor Auto-DL en el panel de control (Dashboard). Ahora redirige correctamente a la página del canal y mantiene el estado activo, evitando recargas fallidas.
+- **Protección contra Redirecciones (Host)**: Implementada una estrategia de doble protección (bloqueo de navegación SPA y evento beforeunload) para evitar que la extensión pierda el contexto de descarga cuando el streamer hace host o raid a otro canal.
+- **Estabilidad del Chat**: Corregidos errores que causaban duplicación de mensajes o fallos al enviar comandos desde la extensión.
 
----
+## 🥚 Otros
 
-## v1.4 (Listo) - Español 🇪🇸
-2026-01-31
-
-### Nuevas Características 🚀
-- **Modal de Opciones de Descarga**: Antes de descargar, ahora puedes elegir descargar todo el VOD o recortar una parte específica.
-- **Interfaz de Recorte**: Una interfaz visual te permite seleccionar los tiempos de Inicio y Fin (HH:MM:SS) para tu descarga.
-- **Compatibilidad con Firefox**: Solucionados problemas críticos en Firefox, incluyendo errores de "Permiso denegado", archivos de 0KB y descargas congeladas.
-- **Corrección de Filtrado de Segmentos**: Resuelto un error crítico donde líneas vacías en la lista de reproducción causaban que Brave/Chrome descargaran todo el VOD en lugar del recorte, o produjeran archivos rotos.
-- **Advertencia de Duración**: Añadido un aviso útil en el overlay sobre posibles discrepancias de duración (hasta 2 minutos) debido a limitaciones de la plataforma.
-
-### Mejoras y Correcciones 🛠️
-- **Estabilidad**: Eliminado el comportamiento de auto-recarga que interrumpía las descargas en algunos navegadores.
-- **Rendimiento**: Solucionadas condiciones de carrera en IndexedDB y gestión de memoria.
-- **UI**: Añadida animación de entrada para el modal y mejorado el estilo del overlay.
-
----
-
-## v1.3 (Ready)
-2026-01-29
-
-### New Features 🚀
-- **Universal Chromium Support**: Added full support for **Brave** and other Chromium browsers that restrict the File System Access API.
-    - **Smart Fallback Mode**: The extension automatically detects if direct disk writing is supported. If not (e.g., in Brave), it switches to **Memory Mode**.
-    - **Memory Mode Safety**: Includes a clear warning and auto-reload mechanism to free up RAM after downloading in this mode.
-- **Real-Time Download Stats**: The download overlay now displays:
-    - **File Size**: Shows the accumulated size of the downloaded video in real-time (e.g., "Size: 1.5 GB").
-    - **ETA**: Estimated time remaining based on current download speed.
-
-### Improvements ✨
-- **Enhanced Overlay**: The progress overlay now provides more detailed information to keep you informed about the download status.
-
----
-
-## v1.2 (2026-01-29)
-
-### New Features 🚀
-- **Global Progress Tracking**: Download progress is now visible in two new places, even when switching tabs:
-    - **Icon Badge**: Percentage shown directly on the extension icon in the toolbar.
-    - **Tab Title**: The browser tab title updates dynamically (e.g., `[45%] Video Title`).
-- **Auto-Mute Tab**: The tab is automatically muted while the download is in progress to prevent the video or other sounds from playing over the overlay. The original audio state (volume, mute status) is restored once the download completes or is cancelled.
-
-### Improvements ✨
-- **Enhanced Cancellation Handling**: Improved logic for cancelling downloads. The "Download in progress" error no longer persists if you cancel and try to download again without reloading the page.
-- **Friendly Error Messages**: The error message shown when cancelling the "Save As" dialog is now much friendlier and no longer shows a raw system error.
-- **Better State Cleanup**: More robust reset of internal flags and database entries when a download is interrupted.
-
-### Bug Fixes 🐛
-- **Fixed an issue where the download button would think a download was still active after a user cancellation.**
-- **Fixed potential ghost files remaining if the user navigated away during the initial setup phase.**
-- **Fixed a visual bug where the tab title would show duplicate percentages (e.g., `[16%] [0%] Title`) due to recursive playlist handling.**
-
----
-
-## v1.3 (Listo) - Español 🇪🇸
-2026-01-29
-
-### Nuevas Características 🚀
-- **Soporte Universal Chromium**: Añadido soporte completo para **Brave** y otros navegadores Chromium que restringen la API de Acceso al Sistema de Archivos.
-    - **Modo Fallback Inteligente**: La extensión detecta automáticamente si la escritura directa en disco está soportada. Si no (ej. en Brave), cambia a **Modo Memoria**.
-    - **Seguridad en Modo Memoria**: Incluye una advertencia clara y un mecanismo de auto-recarga para liberar RAM después de descargar en este modo.
-- **Estadísticas en Tiempo Real**: El overlay de descarga ahora muestra:
-    - **Tamaño del Archivo**: Muestra el tamaño acumulado del video descargado en tiempo real (ej. "Tamaño: 1.5 GB").
-    - **ETA**: Tiempo estimado restante basado en la velocidad de descarga actual.
-
-### Mejoras ✨
-- **Overlay Mejorado**: El overlay de progreso ahora proporciona información más detallada para mantenerte informado sobre el estado de la descarga.
-
----
-
-## v1.2 (Listo) - Español 🇪🇸
-
-### Nuevas Características 🚀
-- **Seguimiento Global del Progreso**: El progreso de la descarga ahora es visible en dos nuevos lugares, incluso al cambiar de pestaña:
-    - **Badge en Icono**: Porcentaje mostrado directamente en el icono de la extensión en la barra de herramientas.
-    - **Título de la Pestaña**: El título de la pestaña del navegador se actualiza dinámicamente (ej. `[45%] Título del Video`).
-- **Auto-Silenciado de Pestaña**: La pestaña se silencia automáticamente mientras la descarga está en curso para evitar que el video u otros sonidos se reproduzcan sobre el overlay. El estado original del audio (volumen, silencio) se restaura una vez que la descarga se completa o se cancela.
-
-### Mejoras ✨
-- **Manejo de Cancelación Mejorado**: Lógica mejorada para cancelar descargas. El error "Descarga en curso" ya no persiste si cancelas e intentas descargar de nuevo sin recargar la página.
-- **Mensajes de Error Amigables**: El mensaje de error que se muestra al cancelar el diálogo de "Guardar como" ahora es mucho más amigable y ya no muestra un error crudo del sistema.
-- **Mejor Limpieza de Estado**: Restablecimiento más robusto de banderas internas y entradas de base de datos cuando se interrumpe una descarga.
+- **Easter Eggs y Secretos**: Se han añadido varias sorpresas y trucos ocultos en el chat. ¿Podrás descubrirlos todos? (Consulta la documentación externa para más pistas).

@@ -1,5 +1,51 @@
 # Release Info / Información de Lanzamiento
 
+## Current Features / Funciones actuales
+
+### 🇬🇧 English
+**Friendly list:**
+*   **One‑click MP4 downloads** directly on the VOD page.
+*   **Quality selector** before downloading.
+*   **Audio‑only (M4A)** mode to save space.
+*   **Trimmed downloads** by choosing start and end.
+*   **Clear progress** with percentage, size, and ETA.
+*   **Global progress** on the extension icon and tab title.
+*   **Auto‑mute** during download and auto‑restore afterward.
+*   **Auto cleanup** if you cancel or change videos.
+*   **Thumbnail download buttons** for faster access.
+*   **Auto‑DL for moderators** when the stream ends.
+*   **Host/raid protection** to keep downloads safe.
+*   **Auto‑retry** for temporary network issues.
+*   **Desktop notifications** when a download finishes or fails.
+*   **Tab sleep prevention** while downloading or waiting.
+*   **Chat command library** in the popup for quick sends.
+*   **Amplifier** to boost audio gain (+0 to +48 dB).
+*   **Follow/unfollow animations** on the website.
+
+---
+
+### 🇪🇸 Español
+**Lista amigable:**
+*   **Descarga MP4 en un clic** desde la página del VOD.
+*   **Selector de calidad** antes de descargar.
+*   **Modo solo audio (M4A)** para ahorrar espacio.
+*   **Descarga recortada** eligiendo inicio y fin.
+*   **Progreso claro** con porcentaje, tamaño y tiempo restante.
+*   **Progreso global** en el ícono de la extensión y el título de la pestaña.
+*   **Auto‑silenciado** durante la descarga y restauración automática.
+*   **Limpieza automática** si cancelas o cambias de video.
+*   **Botones en miniaturas** para descargar VODs rápido.
+*   **Auto‑DL para moderadores** cuando termina el stream.
+*   **Protección contra host/raids** para no perder la descarga.
+*   **Auto‑retry** ante fallos de red temporales.
+*   **Notificaciones de escritorio** al terminar o fallar.
+*   **Prevención de suspensión** de la pestaña mientras descarga o espera.
+*   **Biblioteca de comandos** en el popup para enviar mensajes rápido.
+*   **Amplifier** para subir la ganancia de audio (+0 a +48 dB).
+*   **Animaciones al seguir/dejar de seguir** en la web.
+
+---
+
 ## Version 1.3
 **Release Date / Fecha de Lanzamiento:** 2026-01-29
 

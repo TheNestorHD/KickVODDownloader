@@ -4,8 +4,6 @@
 
 ![Icon](icons/icon128.png)
 
-Download the extension for [Firefox](https://addons.mozilla.org/es-ES/firefox/addon/kick-vod-downloader/) and [Edge](https://microsoftedge.microsoft.com/addons/detail/kick-vod-downloader/doiaphmcfjpfdneockmlagecidagaehn)! (Not yet approved in other stores)
-
 ## 🇬🇧 English
 
 ### 🚀 Key Features
@@ -83,11 +81,3 @@ Como esta extensión no está publicada en la tienda, necesitas instalarla manua
 
 *   This extension is for **personal archiving purposes**. Please respect the copyright and intellectual property rights of streamers.
 *   *Esta extensión es para fines de **archivo personal**. Por favor, respeta los derechos de autor y la propiedad intelectual de los streamers.*
-
-How to use / Cómo usar:
-
-<img width="1872" height="948" alt="msedge_yWYD5yWphh" src="https://github.com/user-attachments/assets/cbe870aa-59d5-406b-ab45-aa4ede78a085" />
-<img width="1872" height="948" alt="msedge_BudCZXOZfC" src="https://github.com/user-attachments/assets/9ead6599-5ecd-4a85-8814-87d86c401274" />
-<img width="503" height="312" alt="msedge_hRJdtkUyBB" src="https://github.com/user-attachments/assets/93438e50-fefa-4034-a2a4-b26009a86f0f" />
-<img width="506" height="342" alt="msedge_1byznrhtWm" src="https://github.com/user-attachments/assets/d9f69c50-9f50-4326-ade4-3856a363c5e3" />
-<img width="1872" height="948" alt="msedge_uDoj2XFpXv" src="https://github.com/user-attachments/assets/45cc2bae-54d8-4197-8bab-37cde5c97d65" />

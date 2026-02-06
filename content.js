@@ -29,6 +29,9 @@ function preventTabInactivity() {
 
         wakeLockAudioContext = new AudioContext();
         wakeLockOscillator = wakeLockAudioContext.createOscillator();
+        // Set frequency to 19.5kHz (near inaudible) to avoid annoyance
+        wakeLockOscillator.frequency.value = 19500;
+        
         const gainNode = wakeLockAudioContext.createGain();
         
         // Ultra-low volume (effectively silent) but keeps audio thread active
@@ -90,6 +93,198 @@ function restorePageAudio() {
         } catch (_) {}
     });
     originalMediaStates.clear();
+}
+
+const followButtonIconPaths = [
+    'M23.2975 6.5L26.5 9.7025V14.6112L16 24.455L5.5 14.6112V9.7025L8.7025 6.5H10.4L16 10.98L21.6 6.5H23.2975ZM24.75 3H20.375L16 6.5L11.625 3H7.25L2 8.25V16.125L16 29.25L30 16.125V8.25L24.75 3Z',
+    'M12.375 1.5H10.1875L8 3.25L5.8125 1.5H3.625L1 4.125V8.0625L8 14.625L15 8.0625V4.125L12.375 1.5Z'
+];
+let followAnimLockUntil = 0;
+let unfollowAnimLockUntil = 0;
+let followListenerAttached = false;
+let ampAudioContext = null;
+let ampGainNode = null;
+let ampSourceNode = null;
+let ampMediaEl = null;
+let ampHideTimer = null;
+let ampGainDb = 0;
+
+function isFollowButton(btn) {
+    if (!btn) return false;
+    const path = btn.querySelector('svg path');
+    if (!path) return false;
+    return followButtonIconPaths.includes(path.getAttribute('d') || '');
+}
+
+function isUnfollowButton(btn) {
+    if (!btn || !btn.classList) return false;
+    if (!btn.classList.contains('bg-negative-base')) return false;
+    if (!btn.classList.contains('text-negative-onNegative')) return false;
+    if (!btn.classList.contains('state-layer-surface')) return false;
+    return true;
+}
+
+function triggerFollowHearts(button) {
+    const now = Date.now();
+    if (now < followAnimLockUntil) return;
+    followAnimLockUntil = now + 600;
+
+    const rect = button.getBoundingClientRect();
+    const originX = rect.left + rect.width / 2;
+    const originY = rect.top + rect.height / 2;
+
+    const container = document.createElement('div');
+    container.className = 'kvd-follow-hearts';
+    container.style.left = `${originX}px`;
+    container.style.top = `${originY}px`;
+    document.body.appendChild(container);
+
+    const count = 36;
+    for (let i = 0; i < count; i++) {
+        const heart = document.createElement('div');
+        heart.className = 'kvd-follow-heart';
+        const x = (Math.random() * 2 - 1) * 420;
+        const y = -(Math.random() * 520 + 140);
+        const s = (Math.random() * 0.6 + 0.6).toFixed(2);
+        const d = (Math.random() * 1.2 + 1.4).toFixed(2);
+        const delay = (Math.random() * 0.2).toFixed(2);
+        heart.style.setProperty('--x', `${x}px`);
+        heart.style.setProperty('--y', `${y}px`);
+        heart.style.setProperty('--s', s);
+        heart.style.setProperty('--d', `${d}s`);
+        heart.style.animationDelay = `${delay}s`;
+        container.appendChild(heart);
+    }
+
+    setTimeout(() => {
+        if (container.parentNode) container.remove();
+    }, 3000);
+}
+
+function triggerUnfollowShatter() {
+    const now = Date.now();
+    if (now < unfollowAnimLockUntil) return;
+    unfollowAnimLockUntil = now + 1500;
+    if (document.body.dataset.kvdUnfollowAnimating === 'true') return;
+    document.body.dataset.kvdUnfollowAnimating = 'true';
+    const overlay = document.createElement('div');
+    overlay.className = 'kvd-unfollow-broken-hearts';
+
+    const heartCount = 28;
+    for (let i = 0; i < heartCount; i++) {
+        const heart = document.createElement('div');
+        heart.className = 'kvd-broken-heart';
+        const x = Math.random() * 100;
+        const y = Math.random() * 100;
+        const s = (Math.random() * 0.6 + 0.5).toFixed(2);
+        const r = (Math.random() * 2 - 1) * 25;
+        const d = 7;
+        const delay = (Math.random() * 0.3).toFixed(2);
+        heart.style.left = `${x}vw`;
+        heart.style.top = `${y}vh`;
+        heart.style.setProperty('--s', s);
+        heart.style.setProperty('--r', `${r}deg`);
+        heart.style.setProperty('--d', `${d}s`);
+        heart.style.animationDelay = `${delay}s`;
+        overlay.appendChild(heart);
+    }
+
+    document.body.appendChild(overlay);
+
+    setTimeout(() => {
+        if (overlay.parentNode) overlay.remove();
+        delete document.body.dataset.kvdUnfollowAnimating;
+    }, 7000);
+}
+
+function attachFollowAnimations() {
+    if (followListenerAttached) return;
+    followListenerAttached = true;
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn) return;
+        if (isFollowButton(btn)) {
+            triggerFollowHearts(btn);
+            return;
+        }
+        if (isUnfollowButton(btn)) {
+            triggerUnfollowShatter();
+        }
+    }, true);
+}
+
+attachFollowAnimations();
+
+function ensureAmpNodes(videoEl) {
+    if (!videoEl) return;
+    if (!ampAudioContext) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        ampAudioContext = new AudioContext();
+    }
+    if (ampMediaEl !== videoEl) {
+        if (ampSourceNode) ampSourceNode.disconnect();
+        if (ampGainNode) ampGainNode.disconnect();
+        ampMediaEl = videoEl;
+        ampSourceNode = ampAudioContext.createMediaElementSource(videoEl);
+        ampGainNode = ampAudioContext.createGain();
+        ampGainNode.gain.value = Math.pow(10, ampGainDb / 20);
+        ampSourceNode.connect(ampGainNode);
+        ampGainNode.connect(ampAudioContext.destination);
+    }
+}
+
+function injectAudioAmplifier() {
+    if (document.getElementById('kvd-amp-container')) return;
+    const controlBar = document.querySelector('.vjs-control-bar');
+    if (!controlBar) return;
+
+    const container = document.createElement('div');
+    container.id = 'kvd-amp-container';
+    container.className = 'kvd-amp-container';
+
+    const icon = document.createElement('img');
+    icon.className = 'kvd-amp-icon';
+    icon.src = chrome.runtime.getURL('assets/amplifier.png');
+    icon.alt = 'Amplifier';
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '48';
+    slider.step = '1';
+    slider.value = '0';
+    slider.className = 'kvd-amp-slider';
+
+    slider.addEventListener('input', () => {
+        const videoEl = document.querySelector('video');
+        if (!videoEl) return;
+        ensureAmpNodes(videoEl);
+        if (!ampAudioContext || !ampGainNode) return;
+        if (ampAudioContext.state === 'suspended') {
+            ampAudioContext.resume().catch(() => {});
+        }
+        const db = parseFloat(slider.value);
+        const gain = Math.pow(10, db / 20);
+        ampGainDb = db;
+        ampGainNode.gain.value = gain;
+    });
+
+    container.addEventListener('pointerenter', () => {
+        if (ampHideTimer) clearTimeout(ampHideTimer);
+        container.classList.add('kvd-amp-open');
+    });
+
+    container.addEventListener('pointerleave', () => {
+        if (ampHideTimer) clearTimeout(ampHideTimer);
+        ampHideTimer = setTimeout(() => {
+            container.classList.remove('kvd-amp-open');
+        }, 800);
+    });
+
+    container.appendChild(icon);
+    container.appendChild(slider);
+    controlBar.appendChild(container);
 }
 
 // IndexedDB Helper for robust cleanup and temporary storage
@@ -267,6 +462,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // --- POPUP: Send Chat ---
     if (request.type === 'SEND_CHAT') {
         sendChatMessage(request.message);
+        return true;
+    }
+
+    if (request.type === 'SET_AUDIO_GAIN_DB') {
+        ampGainDb = parseFloat(request.db);
+        const videoEl = document.querySelector('video');
+        if (videoEl) {
+            ensureAmpNodes(videoEl);
+            if (ampAudioContext && ampGainNode) {
+                if (ampAudioContext.state === 'suspended') {
+                    ampAudioContext.resume().catch(() => {});
+                }
+                const gain = Math.pow(10, ampGainDb / 20);
+                ampGainNode.gain.value = gain;
+            }
+        }
+        sendResponse({ ok: true, db: ampGainDb });
+        return true;
+    }
+
+    if (request.type === 'GET_AUDIO_GAIN_DB') {
+        sendResponse({ ok: true, db: ampGainDb });
         return true;
     }
 });
@@ -2491,6 +2708,45 @@ function checkAutoDownloadTrigger() {
     }
 }
 
+// --- HOST REJECTION LOGIC (Auto-DL) ---
+let lastHostRejection = 0;
+
+function findHostRejectButton() {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const textMatches = (text) => {
+        const cleaned = text.toLowerCase();
+        return cleaned.includes('rechazar') || cleaned.includes('reject') || cleaned.includes('decline');
+    };
+
+    return candidates.find(btn => {
+        const label = btn.getAttribute('aria-label') || '';
+        const title = btn.getAttribute('title') || '';
+        const text = btn.textContent || '';
+        return textMatches(label) || textMatches(title) || textMatches(text);
+    });
+}
+
+function attemptRejectHost() {
+    if (!isStreamerModeEnabled) return;
+    const now = Date.now();
+    // We only want to click at most once every 2 seconds to avoid spamming
+    if (now - lastHostRejection < 2000) return;
+    
+    const rejectBtn = findHostRejectButton();
+    if (rejectBtn && !rejectBtn.disabled) {
+        rejectBtn.click();
+        lastHostRejection = now;
+        console.log('[KVD] Host rejected while Auto-DL active.');
+        
+        // Show a small toast/notification
+        const toast = document.createElement('div');
+        toast.textContent = '🛡️ Auto-DL: Host Rejected / Host Rechazado';
+        toast.style.cssText = 'position: fixed; top: 10px; left: 50%; transform: translateX(-50%); background: rgba(255, 50, 50, 0.9); color: white; padding: 10px 20px; border-radius: 5px; z-index: 100000; font-weight: bold; pointer-events: none;';
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }
+}
+
 let globalCheckCycle = 0;
 
 // Persistencia: Comprobar cada segundo si el botón sigue ahí
@@ -2520,8 +2776,10 @@ setInterval(() => {
     // UI Injection (Every 2 seconds)
     if (globalCheckCycle % 2 === 0) {
         injectStreamerModeUI();
+        // Host Reject Check (Every 2 seconds)
+        attemptRejectHost();
     }
-    
+
     const streamerContainer = document.getElementById('kvd-streamer-container');
     if (streamerContainer) {
         // Visibility Logic: Only visible if Moderator AND Stream is Online (Not Offline)
@@ -2679,42 +2937,42 @@ function injectEasterEggs() {
             // --- Easter Eggs ---
 
             // Roadmap #28: "Imaginate un cubo"
-            if (cleanText.includes('imaginate un cubo')) {
+            if (cleanText === 'imaginate un cubo') {
                 clearChat();
                 triggerCubeEasterEgg();
                 return; 
             }
 
             // "Contexto: No te imaginaste un cubo"
-            if (cleanText.includes('contexto: no te imaginaste un cubo')) {
+            if (cleanText === 'contexto: no te imaginaste un cubo') {
                 clearChat();
                 triggerCubeContextEasterEgg();
                 return;
             }
 
             // "Aguante Pavle"
-            if (cleanText.includes('aguante pavle')) {
+            if (cleanText === 'aguante pavle') {
                 clearChat();
                 triggerPavleEasterEgg();
                 return;
             }
 
             // "Mondongo"
-            if (cleanText.includes('mondongo')) {
+            if (cleanText === 'mondongo') {
                 clearChat();
                 triggerMondongoEasterEgg();
                 return;
             }
 
             // "Mambo"
-            if (cleanText.includes('mambo')) {
+            if (cleanText === 'mambo') {
                 clearChat();
                 triggerMamboEasterEgg();
                 return;
             }
 
             // "Una maroma!" (Barrel Roll)
-            if (cleanText.includes('una maroma!')) {
+            if (cleanText === 'una maroma!') {
                 clearChat();
                 document.body.classList.add('kvd-barrel-roll');
                 setTimeout(() => document.body.classList.remove('kvd-barrel-roll'), 1000);
@@ -2722,7 +2980,7 @@ function injectEasterEggs() {
             }
 
             // "me derrito lpm" (Melt)
-            if (cleanText.includes('me derrito lpm')) {
+            if (cleanText === 'me derrito lpm') {
                 clearChat();
                 document.body.classList.add('kvd-melt-effect');
                 // Wait for animation (4s) + a brief "empty" moment (1s)
@@ -2737,7 +2995,7 @@ function injectEasterEggs() {
             ];
             
             // Enable Admin Mode (Per Channel)
-            if (enableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (enableAdminTricks.includes(cleanText)) {
                 const slug = getChannelSlug();
                 if (!slug) return;
 
@@ -2769,7 +3027,7 @@ function injectEasterEggs() {
                 "ser admin me da ansiedad."
             ];
 
-            if (disableAdminTricks.some(trick => cleanText.includes(trick))) {
+            if (disableAdminTricks.includes(cleanText)) {
                 localStorage.removeItem('kvd_admin_channels');
                 localStorage.removeItem('kvd_admin_trick_enabled'); // Ensure global is gone too
                 

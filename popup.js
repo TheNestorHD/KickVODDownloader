@@ -16,6 +16,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
 
+    const ampSection = document.getElementById('amp-section');
+    const ampSlider = document.getElementById('amp-slider');
+    const ampValue = document.getElementById('amp-value');
+    if (ampSection && ampSlider && ampValue) {
+        ampSection.style.display = 'block';
+        chrome.tabs.sendMessage(tab.id, { type: 'GET_AUDIO_GAIN_DB' }, (response) => {
+            if (chrome.runtime.lastError) {
+                return;
+            }
+            const db = response && typeof response.db === 'number' ? response.db : 0;
+            const clamped = Math.max(0, Math.min(48, Math.round(db)));
+            ampSlider.value = String(clamped);
+            ampValue.textContent = `+${clamped} dB`;
+        });
+        ampSlider.addEventListener('input', () => {
+            const db = parseInt(ampSlider.value, 10);
+            ampValue.textContent = `+${db} dB`;
+            chrome.tabs.sendMessage(tab.id, { type: 'SET_AUDIO_GAIN_DB', db });
+        });
+    }
+
     // Check Admin status
     chrome.tabs.sendMessage(tab.id, { type: 'CHECK_ADMIN' }, (response) => {
         // Handle connection errors (content script not ready, etc)
