@@ -16,6 +16,13 @@ const originalMediaStates = new Map();
 let wakeLockAudioContext = null;
 let wakeLockOscillator = null;
 let wakeLockCount = 0;
+const WAKE_LOCK_DEFAULT_FREQ_HZ = 22000;
+
+function getWakeLockFrequencyHz() {
+    const raw = Number(localStorage.getItem('kvd_wake_lock_freq_hz'));
+    if (!Number.isFinite(raw)) return WAKE_LOCK_DEFAULT_FREQ_HZ;
+    return Math.max(1, Math.min(22000, Math.round(raw)));
+}
 
 function preventTabInactivity() {
     wakeLockCount++;
@@ -30,10 +37,14 @@ function preventTabInactivity() {
         wakeLockAudioContext = new AudioContext();
         wakeLockOscillator = wakeLockAudioContext.createOscillator();
         const gainNode = wakeLockAudioContext.createGain();
-        
-        // Ultra-low volume (effectively silent) but keeps audio thread active
-        gainNode.gain.value = 0.001; 
-        
+
+        wakeLockOscillator.type = 'sine';
+        wakeLockOscillator.frequency.value = getWakeLockFrequencyHz();
+
+        // Practically silent output while keeping the audio thread active.
+        // Default frequency is ultrasonic (22kHz) to avoid audible tones.
+        gainNode.gain.value = 0.00001;
+
         wakeLockOscillator.connect(gainNode);
         gainNode.connect(wakeLockAudioContext.destination);
         wakeLockOscillator.start();
