@@ -140,7 +140,7 @@ async function withStore(storeName, mode, operation) {
 
 function openDB() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, 2); // Version 2
+        const request = indexedDB.open(DB_NAME);
         request.onerror = () => reject(request.error);
         request.onsuccess = () => resolve(request.result);
         request.onupgradeneeded = (event) => {
@@ -2351,6 +2351,21 @@ async function fetchLiveSourceForChannel(slug) {
     return possible[0];
 }
 
+function getLiveFetchOptions(url) {
+    let credentials = 'omit';
+    try {
+        const parsed = new URL(url, window.location.href);
+        if (parsed.hostname === 'kick.com' || parsed.hostname.endsWith('.kick.com')) {
+            credentials = 'include';
+        }
+    } catch (_) {}
+
+    return {
+        cache: 'no-store',
+        credentials
+    };
+}
+
 function ensureLiveAutoDlInfoWindow() {
     let panel = document.getElementById('kvd-live-auto-dl-panel');
     if (panel) return panel;
@@ -2504,7 +2519,7 @@ async function startLiveAutoDlCapture(slug, handle) {
 
             let playlistUrl = masterUrl;
 
-            const masterText = await (await fetch(masterUrl, { cache: 'no-store', credentials: 'include' })).text();
+            const masterText = await (await fetch(masterUrl, getLiveFetchOptions(masterUrl))).text();
             if (masterText.includes('#EXT-X-STREAM-INF')) {
                 const variants = parseMasterVariants(masterText, masterUrl);
                 if (variants.length) {
@@ -2550,7 +2565,7 @@ async function startLiveAutoDlCapture(slug, handle) {
             });
 
             while (!state.stopRequested && isStreamerModeEnabled && autoDlLiveModeEnabled) {
-                const playlistRes = await fetch(playlistUrl, { cache: 'no-store', credentials: 'include' });
+                const playlistRes = await fetch(playlistUrl, getLiveFetchOptions(playlistUrl));
                 if (!playlistRes.ok) throw new Error(`Playlist fetch failed (${playlistRes.status})`);
                 const playlistText = await playlistRes.text();
                 const parsed = parseMediaPlaylist(playlistText, playlistUrl);
@@ -2568,7 +2583,7 @@ async function startLiveAutoDlCapture(slug, handle) {
                     if (state.stopRequested) break;
                     if (state.downloadedSeq.has(seg.seq)) continue;
 
-                    const segRes = await fetch(seg.url, { cache: 'no-store', credentials: 'include' });
+                    const segRes = await fetch(seg.url, getLiveFetchOptions(seg.url));
                     if (!segRes.ok) continue;
                     const bytes = new Uint8Array(await segRes.arrayBuffer());
                     transmuxer.push(bytes);
@@ -2831,41 +2846,39 @@ function handleStreamerModeExit(e) {
     }
 }
 
-// Inject Host Protection Script (SPA Navigation Blocker)
+// Host protection setup (CSP-safe; no inline script injection)
+let isHostProtectionPatched = false;
+
 function injectHostProtectionScript() {
-    if (document.getElementById('kvd-host-protection-script')) return;
+    if (isHostProtectionPatched) return;
+    isHostProtectionPatched = true;
 
-    const script = document.createElement('script');
-    script.id = 'kvd-host-protection-script';
-    script.textContent = `
-        (function() {
-            const originalPush = history.pushState;
-            const originalReplace = history.replaceState;
+    try {
+        const originalPush = history.pushState.bind(history);
+        const originalReplace = history.replaceState.bind(history);
 
-            function shouldBlock() {
-                return document.body.getAttribute('data-kvd-auto-dl') === 'true';
+        const shouldBlock = () => document.body.getAttribute('data-kvd-auto-dl') === 'true';
+
+        history.pushState = function (...args) {
+            if (shouldBlock()) {
+                console.log('[KVD Protection] Blocked history.pushState navigation (Host/Redirect prevented)');
+                return;
             }
+            return originalPush(...args);
+        };
 
-            history.pushState = function(...args) {
-                if (shouldBlock()) {
-                    console.log('[KVD Protection] Blocked history.pushState navigation (Host/Redirect prevented)');
-                    return; // Block navigation
-                }
-                return originalPush.apply(this, args);
-            };
+        history.replaceState = function (...args) {
+            if (shouldBlock()) {
+                console.log('[KVD Protection] Blocked history.replaceState navigation (Host/Redirect prevented)');
+                return;
+            }
+            return originalReplace(...args);
+        };
 
-            history.replaceState = function(...args) {
-                if (shouldBlock()) {
-                    console.log('[KVD Protection] Blocked history.replaceState navigation (Host/Redirect prevented)');
-                    return; // Block navigation
-                }
-                return originalReplace.apply(this, args);
-            };
-            
-            console.log('[KVD] Host Protection Script Injected');
-        })();
-    `;
-    (document.head || document.documentElement).appendChild(script);
+        console.log('[KVD] Host Protection Patches Applied (CSP-safe)');
+    } catch (e) {
+        console.warn('[KVD] Host protection patch failed:', e);
+    }
 }
 
 function injectStreamerModeUI() {
