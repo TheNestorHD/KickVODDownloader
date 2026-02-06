@@ -2276,6 +2276,187 @@ function initFollowButtonEffects() {
 }
 
 
+// --- LIVE AUTO-DL (in-progress + realtime capture) ---
+let autoDlLiveModeEnabled = false;
+let liveAutoDlState = null;
+
+function resolvePlaylistUrl(baseUrl, line) {
+    return line.startsWith('http') ? line : new URL(line, baseUrl).toString();
+}
+
+function parseMasterVariants(masterText, baseUrl) {
+    const lines = masterText.split('\n').map(l => l.trim()).filter(Boolean);
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+        const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+        const nextLine = lines[i + 1];
+        if (!nextLine || nextLine.startsWith('#')) continue;
+        variants.push({
+            bandwidth: bwMatch ? Number(bwMatch[1]) : 0,
+            url: resolvePlaylistUrl(baseUrl, nextLine)
+        });
+    }
+    return variants;
+}
+
+function parseMediaPlaylist(playlistText, playlistUrl) {
+    const lines = playlistText.split('\n').map(l => l.trim()).filter(Boolean);
+    let mediaSequence = 0;
+    let targetDuration = 4;
+    let seqCursor = 0;
+    const segments = [];
+
+    for (const line of lines) {
+        if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+            mediaSequence = Number(line.split(':')[1]) || 0;
+            seqCursor = mediaSequence;
+            continue;
+        }
+        if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+            targetDuration = Number(line.split(':')[1]) || targetDuration;
+            continue;
+        }
+        if (line.startsWith('#')) continue;
+        segments.push({ seq: seqCursor, url: resolvePlaylistUrl(playlistUrl, line) });
+        seqCursor++;
+    }
+
+    return {
+        segments,
+        targetDuration,
+        ended: lines.includes('#EXT-X-ENDLIST')
+    };
+}
+
+async function fetchLiveSourceForChannel(slug) {
+    const response = await fetch(`https://kick.com/api/v1/channels/${slug}`, { credentials: 'include' });
+    if (!response.ok) throw new Error(`Channel API failed (${response.status})`);
+    const data = await response.json();
+
+    const possible = [
+        data?.livestream?.playback_url,
+        data?.livestream?.playbackUrl,
+        data?.livestream?.source,
+        data?.playback_url,
+        data?.stream_url,
+        data?.livestream?.hls_url
+    ].filter(Boolean);
+
+    if (!possible.length) {
+        throw new Error('Live stream source unavailable.');
+    }
+
+    return possible[0];
+}
+
+async function stopLiveAutoDlCapture(reason = 'manual') {
+    if (!liveAutoDlState) return;
+    liveAutoDlState.stopRequested = true;
+    const completion = liveAutoDlState.completionPromise;
+    if (completion) {
+        try { await completion; } catch (e) { console.warn('[Live Auto-DL] stop wait error', e); }
+    }
+    if (reason === 'offline') {
+        sendNotification('✅ Live Auto-DL finished', 'Stream ended and file was finalized.');
+    }
+}
+
+async function startLiveAutoDlCapture(slug, handle) {
+    if (!slug || !handle || liveAutoDlState?.active) return;
+
+    const state = {
+        active: true,
+        stopRequested: false,
+        downloadedSeq: new Set(),
+        completionPromise: null
+    };
+    liveAutoDlState = state;
+
+    state.completionPromise = (async () => {
+        let writable = null;
+        let transmuxer = null;
+        let writeQueue = Promise.resolve();
+        let initWritten = false;
+
+        try {
+            let masterUrl = await fetchLiveSourceForChannel(slug);
+            let playlistUrl = masterUrl;
+
+            const masterText = await (await fetch(masterUrl, { cache: 'no-store', credentials: 'include' })).text();
+            if (masterText.includes('#EXT-X-STREAM-INF')) {
+                const variants = parseMasterVariants(masterText, masterUrl);
+                if (variants.length) {
+                    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+                    playlistUrl = variants[0].url;
+                }
+            }
+
+            writable = await handle.createWritable();
+            currentFileHandle = handle;
+            currentWritable = writable;
+
+            transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
+            transmuxer.on('data', (segment) => {
+                writeQueue = writeQueue.then(async () => {
+                    if (!initWritten && segment.initSegment) {
+                        await writable.write(segment.initSegment);
+                        initWritten = true;
+                    }
+                    if (segment.data) {
+                        await writable.write(segment.data);
+                    }
+                });
+            });
+
+            while (!state.stopRequested && isStreamerModeEnabled && autoDlLiveModeEnabled) {
+                const playlistRes = await fetch(playlistUrl, { cache: 'no-store', credentials: 'include' });
+                if (!playlistRes.ok) throw new Error(`Playlist fetch failed (${playlistRes.status})`);
+                const playlistText = await playlistRes.text();
+                const parsed = parseMediaPlaylist(playlistText, playlistUrl);
+
+                for (const seg of parsed.segments) {
+                    if (state.stopRequested) break;
+                    if (state.downloadedSeq.has(seg.seq)) continue;
+
+                    const segRes = await fetch(seg.url, { cache: 'no-store', credentials: 'include' });
+                    if (!segRes.ok) continue;
+                    const bytes = new Uint8Array(await segRes.arrayBuffer());
+                    transmuxer.push(bytes);
+                    transmuxer.flush();
+                    state.downloadedSeq.add(seg.seq);
+                }
+
+                await writeQueue;
+
+                if (parsed.ended) break;
+                const waitMs = Math.max(1500, Math.min(8000, parsed.targetDuration * 1000));
+                await new Promise(r => setTimeout(r, waitMs));
+            }
+
+            if (transmuxer) transmuxer.flush();
+            await writeQueue;
+            await writable.close();
+            currentWritable = null;
+            currentFileHandle = null;
+        } catch (error) {
+            console.error('[Live Auto-DL] Capture error:', error);
+            if (writable) {
+                try { await writable.abort(); } catch (_) {}
+            }
+            currentWritable = null;
+            currentFileHandle = null;
+            sendNotification('❌ Live Auto-DL error', error?.message || 'Unexpected error');
+        } finally {
+            state.active = false;
+            liveAutoDlState = null;
+        }
+    })();
+
+    return state.completionPromise;
+}
+
 // --- STREAMER MODE (AUTO-DOWNLOAD) ---
 let isStreamerModeEnabled = false;
 let streamEndDetected = false;
@@ -2661,7 +2842,7 @@ function injectStreamerModeUI() {
         }
     };
 
-    const enableAutoDL = async (saveHandle) => {
+    const enableAutoDL = async (saveHandle, liveMode = false) => {
         if (!saveHandle) {
             alert('Auto-DL needs a destination file selected first. / Auto-DL necesita un archivo destino primero.');
             return false;
@@ -2693,10 +2874,23 @@ function injectStreamerModeUI() {
         }
 
         streamEndDetected = false;
+        autoDlLiveModeEnabled = !!liveMode;
+
+        if (autoDlLiveModeEnabled) {
+            const slug = getChannelSlug();
+            if (!slug) {
+                alert('Could not determine channel slug for live capture. / No se pudo determinar el canal para captura en vivo.');
+                autoDlLiveModeEnabled = false;
+                return false;
+            }
+            startLiveAutoDlCapture(slug, saveHandle);
+            sendNotification('🚀 Live Auto-DL active', 'Downloading current VOD progress in realtime.');
+        }
+
         return true;
     };
 
-    const disableAutoDL = () => {
+    const disableAutoDL = async () => {
         isStreamerModeEnabled = false;
         allowTabInactivity();
         clearAutoDLPersistence();
@@ -2722,6 +2916,8 @@ function injectStreamerModeUI() {
         }
 
         streamEndDetected = false;
+        autoDlLiveModeEnabled = false;
+        await stopLiveAutoDlCapture('manual');
         clearHandleFromDB();
     };
 
@@ -2737,7 +2933,8 @@ function injectStreamerModeUI() {
             return;
         }
 
-        await enableAutoDL(handle);
+        const enableLiveMode = confirm('⚡ LIVE AUTO-DL?\n\nStart downloading the current VOD progress now (without overlay) and keep appending in real time until stream ends?\n\n¿AUTO-DL EN VIVO?\n\n¿Comenzar a descargar ahora todo lo generado del VOD (sin overlay) y seguir en tiempo real hasta que termine el stream?');
+        await enableAutoDL(handle, enableLiveMode);
     };
 
     toggle.onclick = async () => {
@@ -2760,7 +2957,7 @@ function injectStreamerModeUI() {
             // Normal Channel Page Activation
             await activateAutoDLOnChannelPage();
         } else {
-            disableAutoDL();
+            await disableAutoDL();
         }
     };
 
@@ -2800,12 +2997,24 @@ function checkStreamStatus() {
 
     if (isOfflineVisible()) {
         streamEndDetected = true;
+
+        if (autoDlLiveModeEnabled) {
+            console.log('[Streamer Mode] Stream offline detected. Finalizing live Auto-DL file...');
+            autoDlLiveModeEnabled = false;
+            stopLiveAutoDlCapture('offline');
+            isStreamerModeEnabled = false;
+            allowTabInactivity();
+            clearAutoDLPersistence();
+            clearHandleFromDB();
+            return;
+        }
+
         console.log('[Streamer Mode] Stream went offline. Triggering Reload & Auto-DL...');
-        
+
         // Hide UI immediately
         const container = document.getElementById('kvd-streamer-container');
         if (container) container.style.display = 'none';
-        
+
         // Set Persistence Flags
         localStorage.setItem(AUTO_DL_PENDING_KEY, 'true');
         const slug = getChannelSlug();
@@ -3067,6 +3276,8 @@ setInterval(() => {
                     isStreamerModeEnabled = false;
                     allowTabInactivity();
                     clearAutoDLPersistence();
+                    autoDlLiveModeEnabled = false;
+                    stopLiveAutoDlCapture('manual');
                     clearHandleFromDB();
                     const statusDiv = document.getElementById('kvd-auto-dl-status');
                     if (statusDiv) statusDiv.remove();
