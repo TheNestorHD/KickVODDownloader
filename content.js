@@ -2200,7 +2200,7 @@ function getChannelSlug() {
 }
 
 // Check for pending auto-download on load (Post-Reload Logic)
-async function checkAutoDownloadTrigger() {
+async function checkPendingAutoDownloadTrigger() {
     if (localStorage.getItem('kvd_auto_dl_pending') === 'true') {
         console.log('[Streamer Mode] Pending auto-download detected. Starting process...');
         localStorage.removeItem('kvd_auto_dl_pending');
@@ -2278,7 +2278,7 @@ async function checkAutoDownloadTrigger() {
 }
 
 // Initialize check
-checkAutoDownloadTrigger();
+checkPendingAutoDownloadTrigger();
 
 // Protection against accidental navigation/host redirects
 function handleStreamerModeExit(e) {
@@ -2581,33 +2581,25 @@ function injectStreamerModeUI() {
 }
 
 function isOfflineVisible() {
-    const offlineContainer = Array.from(document.querySelectorAll('div.z-player')).find((el) => {
+    const structuredOfflinePanel = Array.from(document.querySelectorAll('div.z-player')).find((el) => {
         const badge = el.querySelector('.bg-surfaceInverse-base');
         const headline = el.querySelector('h2');
         if (!badge || !headline) return false;
 
-        const badgeText = (badge.textContent || '').trim().toLowerCase();
-        const headingText = (headline.textContent || '').trim().toLowerCase();
+        // Language-agnostic: rely on the panel structure/classnames instead of text content
+        const hasLayout = el.classList.contains('absolute')
+            && el.classList.contains('bg-surface-base');
+        const badgeLooksLikeStatus = badge.classList.contains('uppercase')
+            && badge.classList.contains('text-sm');
 
-        const hasOfflineBadge = badgeText.includes('desconectado') || badgeText.includes('offline');
-        const hasOfflineHeading = headingText.includes('está fuera de línea') || headingText.includes('is offline');
-
-        return hasOfflineBadge && hasOfflineHeading;
+        return hasLayout && badgeLooksLikeStatus;
     });
 
-    if (offlineContainer) return true;
+    if (structuredOfflinePanel) return true;
 
-    const offlineBadge = document.querySelector('.bg-surfaceInverse-base');
-    if (offlineBadge && (offlineBadge.textContent.includes('Desconectado') || offlineBadge.textContent.includes('Offline'))) {
-        return true;
-    }
-    const h2s = document.querySelectorAll('h2');
-    for (const h of h2s) {
-        if (h.textContent.includes('está fuera de línea') || h.textContent.includes('is offline')) {
-            return true;
-        }
-    }
-    return false;
+    // Fallback (still language-agnostic): known status badge class rendered while stream is offline
+    const offlineBadge = document.querySelector('div.z-player .bg-surfaceInverse-base.text-surfaceInverse-onInverse');
+    return !!offlineBadge;
 }
 
 function checkStreamStatus() {
@@ -2811,7 +2803,7 @@ function injectButton() {
 }
 
 // Check if we need to auto-trigger download from thumbnail click
-function checkAutoDownloadTrigger() {
+function checkThumbnailAutoDownloadTrigger() {
     const autoDl = sessionStorage.getItem('kvd_auto_download');
     if (!autoDl) return;
 
@@ -2847,7 +2839,7 @@ setInterval(() => {
     }
 
     // Check for auto-download trigger from thumbnail (Every 1s - Critical)
-    checkAutoDownloadTrigger();
+    checkThumbnailAutoDownloadTrigger();
 
     // Navigation detection (Every 1s - Critical)
     if (currentDownloadVideoId && currentId && currentId !== currentDownloadVideoId) {
