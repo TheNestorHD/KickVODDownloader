@@ -2351,6 +2351,92 @@ async function fetchLiveSourceForChannel(slug) {
     return possible[0];
 }
 
+function ensureLiveAutoDlInfoWindow() {
+    let panel = document.getElementById('kvd-live-auto-dl-panel');
+    if (panel) return panel;
+
+    panel = document.createElement('div');
+    panel.id = 'kvd-live-auto-dl-panel';
+    panel.style.cssText = [
+        'position:fixed',
+        'top:92px',
+        'right:16px',
+        'width:250px',
+        'background:rgba(16,16,16,0.92)',
+        'color:#fff',
+        'border:1px solid rgba(83,252,24,0.7)',
+        'border-radius:10px',
+        'padding:8px 10px 10px',
+        'font-family:Inter,system-ui,sans-serif',
+        'font-size:12px',
+        'line-height:1.35',
+        'z-index:999999',
+        'box-shadow:0 10px 30px rgba(0,0,0,0.35)',
+        'user-select:none'
+    ].join(';');
+
+    panel.innerHTML = `
+        <div id="kvd-live-auto-dl-header" style="cursor:move;font-weight:700;color:#53fc18;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px;">
+            <span>🚀 Live Auto-DL</span>
+            <span style="opacity:.8">drag</span>
+        </div>
+        <div id="kvd-live-auto-dl-progress" style="margin-bottom:3px;">Progress: 0%</div>
+        <div id="kvd-live-auto-dl-size" style="margin-bottom:3px;">Size: 0 Bytes</div>
+        <div id="kvd-live-auto-dl-speed" style="margin-bottom:3px;">Speed: 0 B/s</div>
+        <div id="kvd-live-auto-dl-segments" style="opacity:.85;">Segments: 0 / 0</div>
+    `;
+
+    const header = panel.querySelector('#kvd-live-auto-dl-header');
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    const onMove = (event) => {
+        if (!dragging) return;
+        panel.style.left = `${event.clientX - offsetX}px`;
+        panel.style.top = `${event.clientY - offsetY}px`;
+        panel.style.right = 'auto';
+    };
+
+    const onUp = () => {
+        dragging = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    };
+
+    header.addEventListener('mousedown', (event) => {
+        dragging = true;
+        const rect = panel.getBoundingClientRect();
+        offsetX = event.clientX - rect.left;
+        offsetY = event.clientY - rect.top;
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+
+    document.body.appendChild(panel);
+    return panel;
+}
+
+function updateLiveAutoDlInfoWindow({ downloadedSegments = 0, visibleSegments = 0, bytes = 0, speed = 0 } = {}) {
+    const panel = ensureLiveAutoDlInfoWindow();
+    const progressPct = visibleSegments > 0 ? Math.min(100, Math.round((downloadedSegments / visibleSegments) * 100)) : 0;
+
+    const progressEl = panel.querySelector('#kvd-live-auto-dl-progress');
+    const sizeEl = panel.querySelector('#kvd-live-auto-dl-size');
+    const speedEl = panel.querySelector('#kvd-live-auto-dl-speed');
+    const segEl = panel.querySelector('#kvd-live-auto-dl-segments');
+
+    if (progressEl) progressEl.textContent = `Progress: ${progressPct}%`;
+    if (sizeEl) sizeEl.textContent = `Size: ${formatBytes(bytes)}`;
+    if (speedEl) speedEl.textContent = `Speed: ${formatBytes(Math.max(0, speed))}/s`;
+    if (segEl) segEl.textContent = `Segments: ${downloadedSegments} / ${visibleSegments}`;
+}
+
+function removeLiveAutoDlInfoWindow() {
+    const panel = document.getElementById('kvd-live-auto-dl-panel');
+    if (panel) panel.remove();
+}
+
 async function stopLiveAutoDlCapture(reason = 'manual') {
     if (!liveAutoDlState) return;
     liveAutoDlState.stopRequested = true;
@@ -2370,9 +2456,15 @@ async function startLiveAutoDlCapture(slug, handle) {
         active: true,
         stopRequested: false,
         downloadedSeq: new Set(),
-        completionPromise: null
+        completionPromise: null,
+        bytesDownloaded: 0,
+        speedBytesPerSecond: 0,
+        lastSpeedSampleTs: Date.now(),
+        lastSpeedSampleBytes: 0,
+        maxVisibleSeq: 0
     };
     liveAutoDlState = state;
+    updateLiveAutoDlInfoWindow({ downloadedSegments: 0, visibleSegments: 0, bytes: 0, speed: 0 });
 
     state.completionPromise = (async () => {
         let writable = null;
@@ -2403,10 +2495,28 @@ async function startLiveAutoDlCapture(slug, handle) {
                     if (!initWritten && segment.initSegment) {
                         await writable.write(segment.initSegment);
                         initWritten = true;
+                        state.bytesDownloaded += segment.initSegment.byteLength || 0;
                     }
                     if (segment.data) {
                         await writable.write(segment.data);
+                        state.bytesDownloaded += segment.data.byteLength || 0;
                     }
+
+                    const now = Date.now();
+                    const elapsedMs = now - state.lastSpeedSampleTs;
+                    if (elapsedMs >= 800) {
+                        const bytesDelta = state.bytesDownloaded - state.lastSpeedSampleBytes;
+                        state.speedBytesPerSecond = (bytesDelta * 1000) / elapsedMs;
+                        state.lastSpeedSampleTs = now;
+                        state.lastSpeedSampleBytes = state.bytesDownloaded;
+                    }
+
+                    updateLiveAutoDlInfoWindow({
+                        downloadedSegments: state.downloadedSeq.size,
+                        visibleSegments: state.maxVisibleSeq,
+                        bytes: state.bytesDownloaded,
+                        speed: state.speedBytesPerSecond
+                    });
                 });
             });
 
@@ -2415,6 +2525,14 @@ async function startLiveAutoDlCapture(slug, handle) {
                 if (!playlistRes.ok) throw new Error(`Playlist fetch failed (${playlistRes.status})`);
                 const playlistText = await playlistRes.text();
                 const parsed = parseMediaPlaylist(playlistText, playlistUrl);
+                state.maxVisibleSeq = Math.max(state.maxVisibleSeq, parsed.segments.length);
+
+                updateLiveAutoDlInfoWindow({
+                    downloadedSegments: state.downloadedSeq.size,
+                    visibleSegments: state.maxVisibleSeq,
+                    bytes: state.bytesDownloaded,
+                    speed: state.speedBytesPerSecond
+                });
 
                 for (const seg of parsed.segments) {
                     if (state.stopRequested) break;
@@ -2451,6 +2569,7 @@ async function startLiveAutoDlCapture(slug, handle) {
         } finally {
             state.active = false;
             liveAutoDlState = null;
+            removeLiveAutoDlInfoWindow();
         }
     })();
 
