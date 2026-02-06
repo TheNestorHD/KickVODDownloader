@@ -171,6 +171,17 @@ async function clearHandleFromDB() {
     } catch (e) { console.error('DB Clear Handle Error', e); }
 }
 
+async function getHandleFromDB() {
+    try {
+        return await withStore(HANDLE_STORE, 'readonly', (store) => {
+            return requestToPromise(store.get('interrupted_download'));
+        });
+    } catch (e) {
+        console.error('DB Get Handle Error', e);
+        return null;
+    }
+}
+
 async function saveChunkToDB(chunk) {
     try {
         await withStore(CHUNK_STORE, 'readwrite', (store) => {
@@ -2241,12 +2252,16 @@ async function checkAutoDownloadTrigger() {
                     dummyBtn.style.display = 'none';
                     document.body.appendChild(dummyBtn);
 
-                    // Start Download
-                    // Pass null for preOpenedHandle and true for forceMemory to bypass user gesture requirement
-                    await downloadSegments(videoData.source, dummyBtn, videoData.duration, 0, -1, null, true);
-                    
-                    statusDiv.innerHTML = '<strong>✅ Auto-DL Started!</strong><br>Using Memory Mode (No interaction required).<br>Modo Memoria activo.';
-                    setTimeout(() => statusDiv.remove(), 10000);
+                    // Start Download with pre-selected save handle (picked when Auto-DL was enabled)
+                    const preOpenedHandle = await getHandleFromDB();
+                    if (!preOpenedHandle) {
+                        throw new Error('Missing preselected save file. Re-enable Auto-DL and choose a destination file.');
+                    }
+
+                    await downloadSegments(videoData.source, dummyBtn, videoData.duration, 0, -1, preOpenedHandle, false, videoId);
+
+                    statusDiv.innerHTML = '<strong>✅ Auto-DL finished!</strong><br>Latest VOD downloaded at max quality.<br>Último VOD descargado en máxima calidad.';
+                    setTimeout(() => statusDiv.remove(), 8000);
                 } else {
                     throw new Error('Video source not found');
                 }
@@ -2451,7 +2466,14 @@ function injectStreamerModeUI() {
     }
     
     // Event
-    const enableAutoDL = () => {
+    const enableAutoDL = async (saveHandle) => {
+        if (!saveHandle) {
+            alert('Auto-DL needs a destination file selected first. / Auto-DL necesita un archivo destino primero.');
+            return false;
+        }
+
+        await saveHandleToDB(saveHandle);
+
         isStreamerModeEnabled = true;
         preventTabInactivity(); // Prevent tab sleep
         
@@ -2475,6 +2497,7 @@ function injectStreamerModeUI() {
         }
         
         streamEndDetected = false;
+        return true;
     };
 
     const disableAutoDL = () => {
@@ -2499,9 +2522,10 @@ function injectStreamerModeUI() {
         }
         
         streamEndDetected = false;
+        clearHandleFromDB();
     };
 
-    toggle.onclick = () => {
+    toggle.onclick = async () => {
         if (!isStreamerModeEnabled) {
             // Check if we are on Dashboard
             if (window.location.hostname === 'dashboard.kick.com') {
@@ -2518,8 +2542,29 @@ function injectStreamerModeUI() {
             }
 
             // Normal Channel Page Activation
-            if (confirm('⚠️ ENABLE AUTO-DOWNLOAD?\n\n• When "Offline" is detected, the page will RELOAD IMMEDIATELY.\n• The system will wait 2 MINUTES for VOD generation.\n• Then it will automatically download the latest VOD.\n• Host/Redirect Protection will be ACTIVE.\n\n¿ACTIVAR AUTO-DESCARGA?\n• Al detectar "Offline", la página se RECARGARÁ INMEDIATAMENTE.\n• El sistema esperará 2 MINUTOS para la generación del VOD.\n• Luego descargará automáticamente el último VOD.\n• Protección contra Host/Redirección estará ACTIVA.')) {
-                enableAutoDL();
+            if (confirm('⚠️ ENABLE AUTO-DOWNLOAD?\n\n• When "Offline" is detected, the page will RELOAD IMMEDIATELY.\n• The system will wait 2 MINUTES for VOD generation.\n• Then it will automatically download the latest VOD.\n• Host/Redirect Protection will be ACTIVE.\n• You will choose the destination file NOW so no prompt appears later.\n\n¿ACTIVAR AUTO-DESCARGA?\n• Al detectar "Offline", la página se RECARGARÁ INMEDIATAMENTE.\n• El sistema esperará 2 MINUTOS para la generación del VOD.\n• Luego descargará automáticamente el último VOD.\n• Protección contra Host/Redirección estará ACTIVA.\n• Elegirás el archivo destino AHORA para evitar prompts luego.')) {
+                if (!window.showSaveFilePicker) {
+                    alert('Your browser does not support file pre-selection for Auto-DL. / Tu navegador no soporta preselección de archivo para Auto-DL.');
+                    return;
+                }
+
+                let handle = null;
+                try {
+                    const slug = getChannelSlug() || 'channel';
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    handle = await window.showSaveFilePicker({
+                        suggestedName: `kick-vod-auto-${slug}-${timestamp}.mp4`,
+                        types: [{
+                            description: 'MP4 Video',
+                            accept: { 'video/mp4': ['.mp4'] }
+                        }]
+                    });
+                } catch (pickerError) {
+                    console.log('[Streamer Mode] Save picker cancelled:', pickerError);
+                    return;
+                }
+
+                await enableAutoDL(handle);
             }
         } else {
             disableAutoDL();
@@ -2529,13 +2574,29 @@ function injectStreamerModeUI() {
     // Check for Carry-Over State (Redirected from Dashboard)
     if (localStorage.getItem('kvd_auto_dl_carry_over') === 'true') {
         localStorage.removeItem('kvd_auto_dl_carry_over');
-        // Activate immediately without confirm
-        enableAutoDL();
+        // Activate on channel page flow (asks destination file picker first)
+        toggle.click();
         console.log('[Streamer Mode] Auto-DL enabled via Dashboard redirect.');
     }
 }
 
 function isOfflineVisible() {
+    const offlineContainer = Array.from(document.querySelectorAll('div.z-player')).find((el) => {
+        const badge = el.querySelector('.bg-surfaceInverse-base');
+        const headline = el.querySelector('h2');
+        if (!badge || !headline) return false;
+
+        const badgeText = (badge.textContent || '').trim().toLowerCase();
+        const headingText = (headline.textContent || '').trim().toLowerCase();
+
+        const hasOfflineBadge = badgeText.includes('desconectado') || badgeText.includes('offline');
+        const hasOfflineHeading = headingText.includes('está fuera de línea') || headingText.includes('is offline');
+
+        return hasOfflineBadge && hasOfflineHeading;
+    });
+
+    if (offlineContainer) return true;
+
     const offlineBadge = document.querySelector('.bg-surfaceInverse-base');
     if (offlineBadge && (offlineBadge.textContent.includes('Desconectado') || offlineBadge.textContent.includes('Offline'))) {
         return true;
