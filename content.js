@@ -261,6 +261,7 @@ function showFirstKickVisitAlert() {
 // Run cleanup check on load
 checkAndCleanup();
 showFirstKickVisitAlert();
+initFollowButtonEffects();
 
 const isValidRuntimeMessage = (sender, request) => {
     return sender && sender.id === chrome.runtime.id && request && typeof request.type === 'string';
@@ -2143,6 +2144,138 @@ function createDownloadOptionsModal(videoId, durationMs, btn) {
     };
 }
 
+let isUnfollowEffectRunning = false;
+
+function injectFollowEffectsStyles() {
+    if (document.getElementById('kvd-follow-effects-style')) return;
+    const style = document.createElement('style');
+    style.id = 'kvd-follow-effects-style';
+    style.textContent = `
+        .kvd-confetti-piece {
+            position: fixed;
+            width: 8px;
+            height: 12px;
+            border-radius: 2px;
+            pointer-events: none;
+            z-index: 999999;
+            will-change: transform, opacity;
+        }
+        .kvd-unfollow-crack-overlay {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 999998;
+            opacity: 0;
+            background-image:
+                linear-gradient(115deg, transparent 47%, rgba(255,255,255,0.85) 49%, transparent 51%),
+                linear-gradient(68deg, transparent 42%, rgba(255,255,255,0.7) 44%, transparent 46%),
+                linear-gradient(20deg, transparent 58%, rgba(255,255,255,0.75) 60%, transparent 62%);
+            animation: kvdCrackFlash 420ms ease-out forwards;
+        }
+        .kvd-unfollow-breaking {
+            animation: kvdPageBreak 1.5s ease-in forwards;
+            transform-origin: center top;
+            overflow: hidden;
+        }
+        .kvd-unfollow-fade-in {
+            animation: kvdPageRebuild 420ms ease-out forwards;
+        }
+        @keyframes kvdCrackFlash {
+            0% { opacity: 0; }
+            25% { opacity: 0.85; }
+            100% { opacity: 0; }
+        }
+        @keyframes kvdPageBreak {
+            0% { transform: translateY(0) scale(1); filter: none; opacity: 1; }
+            18% { transform: translateY(0) translateX(-5px) rotate(-0.3deg); }
+            42% { transform: translateY(18px) translateX(6px) rotate(0.25deg) scale(0.995); }
+            70% { transform: translateY(55vh) rotate(-0.7deg) scale(0.98); opacity: 0.8; }
+            100% { transform: translateY(115vh) rotate(-1.1deg) scale(0.96); opacity: 0; }
+        }
+        @keyframes kvdPageRebuild {
+            0% { opacity: 0; transform: translateY(8px) scale(0.997); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function triggerFollowConfetti(button) {
+    const rect = button.getBoundingClientRect();
+    const startX = rect.left + (rect.width / 2);
+    const startY = rect.top + (rect.height / 2);
+    const colors = ['#53fc18', '#ffffff', '#00d4ff', '#ffcf40', '#ff4d6d'];
+
+    for (let i = 0; i < 36; i++) {
+        const piece = document.createElement('div');
+        piece.className = 'kvd-confetti-piece';
+        piece.style.left = `${startX}px`;
+        piece.style.top = `${startY}px`;
+        piece.style.background = colors[i % colors.length];
+        piece.style.transform = `rotate(${Math.random() * 360}deg)`;
+        document.body.appendChild(piece);
+
+        const angle = (Math.PI * 2 * i) / 36;
+        const distance = 90 + Math.random() * 170;
+        const driftX = Math.cos(angle) * distance;
+        const driftY = Math.sin(angle) * distance + 120 + Math.random() * 120;
+
+        const animation = piece.animate([
+            { transform: `translate(0, 0) rotate(0deg)`, opacity: 1 },
+            { transform: `translate(${driftX}px, ${driftY}px) rotate(${360 + Math.random() * 540}deg)`, opacity: 0 }
+        ], {
+            duration: 800 + Math.random() * 500,
+            easing: 'cubic-bezier(0.12, 0.75, 0.25, 1)',
+            fill: 'forwards'
+        });
+
+        animation.onfinish = () => piece.remove();
+    }
+}
+
+function triggerUnfollowBreakEffect() {
+    if (isUnfollowEffectRunning) return;
+    isUnfollowEffectRunning = true;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'kvd-unfollow-crack-overlay';
+    document.body.appendChild(overlay);
+
+    document.body.classList.add('kvd-unfollow-breaking');
+
+    setTimeout(() => {
+        document.body.classList.remove('kvd-unfollow-breaking');
+        document.body.classList.add('kvd-unfollow-fade-in');
+        requestAnimationFrame(() => {
+            setTimeout(() => {
+                document.body.classList.remove('kvd-unfollow-fade-in');
+                overlay.remove();
+                isUnfollowEffectRunning = false;
+            }, 450);
+        });
+    }, 1500);
+}
+
+function initFollowButtonEffects() {
+    if (window.__kvdFollowEffectsBound) return;
+    window.__kvdFollowEffectsBound = true;
+    injectFollowEffectsStyles();
+
+    document.addEventListener('click', (event) => {
+        const followButton = event.target.closest('button[data-testid="follow-button"]');
+        if (followButton && !followButton.disabled) {
+            triggerFollowConfetti(followButton);
+            return;
+        }
+
+        const maybeUnfollowButton = event.target.closest('button.bg-negative-base.text-negative-onNegative');
+        if (maybeUnfollowButton && !maybeUnfollowButton.disabled) {
+            triggerUnfollowBreakEffect();
+        }
+    }, true);
+}
+
+
 // --- STREAMER MODE (AUTO-DOWNLOAD) ---
 let isStreamerModeEnabled = false;
 let streamEndDetected = false;
@@ -2410,7 +2543,12 @@ function injectStreamerModeUI() {
                 }
             }
         }
-    } 
+
+        // Dashboard should only keep the VOD shortcut button; Auto-DL toggle removed here.
+        const existingContainer = document.getElementById('kvd-streamer-container');
+        if (existingContainer) existingContainer.remove();
+        return;
+    }
     // Strategy 2: Channel Page Injection (Search Bar)
     else {
         // Find Target: Search Bar Container (Top Nav)
