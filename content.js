@@ -2330,25 +2330,35 @@ function parseMediaPlaylist(playlistText, playlistUrl) {
     };
 }
 
-async function fetchLiveSourceForChannel(slug) {
+async function fetchLiveCaptureSourcesForChannel(slug) {
     const response = await fetch(`https://kick.com/api/v1/channels/${slug}`, { credentials: 'include' });
     if (!response.ok) throw new Error(`Channel API failed (${response.status})`);
     const data = await response.json();
 
-    const possible = [
+    const liveUrl = [
         data?.livestream?.playback_url,
         data?.livestream?.playbackUrl,
         data?.livestream?.source,
         data?.playback_url,
         data?.stream_url,
         data?.livestream?.hls_url
-    ].filter(Boolean);
+    ].find(Boolean) || null;
 
-    if (!possible.length) {
+    const liveVideoId = data?.livestream?.video?.uuid || data?.livestream?.video?.id || null;
+    let vodUrl = null;
+
+    if (liveVideoId) {
+        const videoData = await fetchVideoData(liveVideoId);
+        if (videoData && videoData.source) {
+            vodUrl = videoData.source;
+        }
+    }
+
+    if (!liveUrl && !vodUrl) {
         throw new Error('Live stream source unavailable.');
     }
 
-    return possible[0];
+    return { liveUrl, vodUrl, liveVideoId };
 }
 
 function getLiveFetchOptions(url) {
@@ -2476,7 +2486,7 @@ async function startLiveAutoDlCapture(slug, handle) {
     const state = {
         active: true,
         stopRequested: false,
-        downloadedSeq: new Set(),
+        downloadedSegments: new Set(),
         completionPromise: null,
         bytesDownloaded: 0,
         speedBytesPerSecond: 0,
@@ -2494,34 +2504,46 @@ async function startLiveAutoDlCapture(slug, handle) {
         let initWritten = false;
 
         try {
-            let masterUrl = null;
+            let sourceBundle = null;
             for (let attempt = 1; attempt <= 12 && !state.stopRequested; attempt++) {
                 try {
                     updateLiveAutoDlInfoWindow({
-                        downloadedSegments: state.downloadedSeq.size,
+                        downloadedSegments: state.downloadedSegments.size,
                         visibleSegments: state.maxVisibleSeq,
                         bytes: state.bytesDownloaded,
                         speed: state.speedBytesPerSecond,
-                        status: `Waiting for live source... (${attempt}/12)`,
+                        status: `Resolving stream source... (${attempt}/12)`,
                         statusColor: '#ffcf40'
                     });
-                    masterUrl = await fetchLiveSourceForChannel(slug);
-                    break;
+                    sourceBundle = await fetchLiveCaptureSourcesForChannel(slug);
+                    if (sourceBundle?.vodUrl || sourceBundle?.liveUrl) break;
                 } catch (sourceError) {
                     if (attempt >= 12) throw sourceError;
                     await new Promise(r => setTimeout(r, 3000));
                 }
             }
 
-            if (!masterUrl) {
+            if (!sourceBundle || (!sourceBundle.vodUrl && !sourceBundle.liveUrl)) {
                 throw new Error('Live source was not available in time.');
             }
 
-            let playlistUrl = masterUrl;
+            const preferredMasterUrl = sourceBundle.vodUrl || sourceBundle.liveUrl;
+            const preferredType = sourceBundle.vodUrl ? 'full VOD backfill' : 'live DVR window';
 
-            const masterText = await (await fetch(masterUrl, getLiveFetchOptions(masterUrl))).text();
+            updateLiveAutoDlInfoWindow({
+                downloadedSegments: state.downloadedSegments.size,
+                visibleSegments: state.maxVisibleSeq,
+                bytes: state.bytesDownloaded,
+                speed: state.speedBytesPerSecond,
+                status: `Using ${preferredType} source...`,
+                statusColor: sourceBundle.vodUrl ? '#53fc18' : '#ffcf40'
+            });
+
+            let playlistUrl = preferredMasterUrl;
+
+            const masterText = await (await fetch(preferredMasterUrl, getLiveFetchOptions(preferredMasterUrl))).text();
             if (masterText.includes('#EXT-X-STREAM-INF')) {
-                const variants = parseMasterVariants(masterText, masterUrl);
+                const variants = parseMasterVariants(masterText, preferredMasterUrl);
                 if (variants.length) {
                     variants.sort((a, b) => b.bandwidth - a.bandwidth);
                     playlistUrl = variants[0].url;
@@ -2555,11 +2577,11 @@ async function startLiveAutoDlCapture(slug, handle) {
                     }
 
                     updateLiveAutoDlInfoWindow({
-                        downloadedSegments: state.downloadedSeq.size,
+                        downloadedSegments: state.downloadedSegments.size,
                         visibleSegments: state.maxVisibleSeq,
                         bytes: state.bytesDownloaded,
                         speed: state.speedBytesPerSecond,
-                        status: 'Downloading in realtime...'
+                        status: 'Downloading/backfilling in realtime...'
                     });
                 });
             });
@@ -2572,23 +2594,23 @@ async function startLiveAutoDlCapture(slug, handle) {
                 state.maxVisibleSeq = Math.max(state.maxVisibleSeq, parsed.segments.length);
 
                 updateLiveAutoDlInfoWindow({
-                    downloadedSegments: state.downloadedSeq.size,
+                    downloadedSegments: state.downloadedSegments.size,
                     visibleSegments: state.maxVisibleSeq,
                     bytes: state.bytesDownloaded,
                     speed: state.speedBytesPerSecond,
-                    status: 'Monitoring live playlist...'
+                    status: 'Monitoring playlist for new/old segments...'
                 });
 
                 for (const seg of parsed.segments) {
                     if (state.stopRequested) break;
-                    if (state.downloadedSeq.has(seg.seq)) continue;
+                    if (state.downloadedSegments.has(seg.url)) continue;
 
                     const segRes = await fetch(seg.url, getLiveFetchOptions(seg.url));
                     if (!segRes.ok) continue;
                     const bytes = new Uint8Array(await segRes.arrayBuffer());
                     transmuxer.push(bytes);
                     transmuxer.flush();
-                    state.downloadedSeq.add(seg.seq);
+                    state.downloadedSegments.add(seg.url);
                 }
 
                 await writeQueue;
@@ -2601,7 +2623,7 @@ async function startLiveAutoDlCapture(slug, handle) {
             if (transmuxer) transmuxer.flush();
             await writeQueue;
             updateLiveAutoDlInfoWindow({
-                downloadedSegments: state.downloadedSeq.size,
+                downloadedSegments: state.downloadedSegments.size,
                 visibleSegments: state.maxVisibleSeq,
                 bytes: state.bytesDownloaded,
                 speed: state.speedBytesPerSecond,
@@ -2620,7 +2642,7 @@ async function startLiveAutoDlCapture(slug, handle) {
             currentFileHandle = null;
 
             updateLiveAutoDlInfoWindow({
-                downloadedSegments: state.downloadedSeq.size,
+                downloadedSegments: state.downloadedSegments.size,
                 visibleSegments: state.maxVisibleSeq,
                 bytes: state.bytesDownloaded,
                 speed: state.speedBytesPerSecond,
