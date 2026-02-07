@@ -26,6 +26,7 @@ Since this extension is not published in the Web Store, you need to install it m
 2.  Open your browser's extension manager:
     *   **Chrome**: Go to `chrome://extensions/`
     *   **Edge**: Go to `edge://extensions/`
+    *   **Brave**: Go to `brave://extensions/`
 3.  Enable **Developer mode** (toggle switch usually located at the top right corner).
 4.  Click the **Load unpacked** (Chrome) or **Load unpacked extension** (Edge) button.
 5.  Select the **folder** where you extracted the files (the one containing `manifest.json`).
@@ -63,6 +64,7 @@ Como esta extensión no está publicada en la tienda, necesitas instalarla manua
 2.  Abre el gestor de extensiones de tu navegador:
     *   **Chrome**: Ve a `chrome://extensions/`
     *   **Edge**: Ve a `edge://extensions/`
+    *   **Brave**: Ve a `brave://extensions/`
 3.  Activa el **Modo de desarrollador** (interruptor generalmente ubicado arriba a la derecha).
 4.  Haz clic en el botón **Cargar descomprimida** (Chrome) o **Carga desempaquetada** (Edge).
 5.  Selecciona la **carpeta** donde extrajiste los archivos (la carpeta que contiene el archivo `manifest.json`).
