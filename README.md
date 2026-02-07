@@ -20,8 +20,7 @@
 
 Since this extension is not published in the Web Store, you need to install it manually:
 
-1.  **Download** this repository:
-    *   Click on the green **Code** button -> **Download ZIP**.
+1.  **[Download](https://github.com/TheNestorHD/KickVODDownloader/releases/tag/v2.0.0_The_Definitive_Update)** this repository:
     *   Unzip the file into a folder.
 2.  Open your browser's extension manager:
     *   **Chrome**: Go to `chrome://extensions/`
@@ -58,8 +57,7 @@ Since this extension is not published in the Web Store, you need to install it m
 
 Como esta extensión no está publicada en la tienda, necesitas instalarla manualmente:
 
-1.  **Descarga** este repositorio:
-    *   Haz clic en el botón verde **Code** -> **Download ZIP**.
+1.  **[Descarga](https://github.com/TheNestorHD/KickVODDownloader/releases/tag/v2.0.0_The_Definitive_Update)** este repositorio:
     *   Descomprime el archivo en una carpeta.
 2.  Abre el gestor de extensiones de tu navegador:
     *   **Chrome**: Ve a `chrome://extensions/`
